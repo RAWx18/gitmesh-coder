@@ -22,7 +22,7 @@ dynamic = ["dependencies", "optional-dependencies", "version"]
 Homepage = "https://github.com/LF-Decentralized-Trust-Mentorships/gitmesh"
 
 [project.scripts]
-aider = "aider.main:main"
+cosmos = "cosmos.main:main"
 
 [tool.setuptools.dynamic]
 dependencies = { file = "requirements.txt" }
@@ -37,15 +37,15 @@ playwright = { file = "requirements/requirements-playwright.txt" }
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["aider"]
+include = ["cosmos"]
 
 [build-system]
 requires = ["setuptools>=68", "setuptools_scm[toml]>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
-write_to = "aider/_version.py"
+write_to = "cosmos/_version.py"
 
 [tool.codespell]
-skip = "*.svg,Gemfile.lock,tests/fixtures/*,aider/website/assets/*"
+skip = "*.svg,Gemfile.lock,tests/fixtures/*,cosmos/website/assets/*"
 write-changes = true

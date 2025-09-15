@@ -1,8 +1,8 @@
 .DS_Store
 .vscode/
-aider.code-workspace
+cosmos.code-workspace
 *.pyc
-.aider*
+.cosmos*
 __pycache__
 gitmesh.dev.egg-info/
 build
@@ -11,11 +11,12 @@ Gemfile.lock
 _site
 .jekyll-cache/
 .jekyll-metadata
-aider/__version__.py
-aider/_version.py
+cosmos/__version__.py
+cosmos/_version.py
 .venv/
 .#*
 .gitattributes
 tmp.benchmarks/
 .docker_bash_history
 .env
+venv/
