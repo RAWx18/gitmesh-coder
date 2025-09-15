@@ -3,7 +3,8 @@
 aider.code-workspace
 *.pyc
 .aider*
-aider_chat.egg-info/
+__pycache__
+gitmesh.dev.egg-info/
 build
 dist/
 Gemfile.lock
