@@ -94,10 +94,6 @@ class YamlHelpFormatter(argparse.HelpFormatter):
 # Place in your home dir, or at the root of your git repo.
 ##########################################################
 
-# Note: You can only put OpenAI and Anthropic API keys in the YAML
-# config file. Keys for all APIs can be stored in a .env file
-# https://cosmos.chat/docs/config/dotenv.html
-
 """
 
     def _format_action(self, action):
