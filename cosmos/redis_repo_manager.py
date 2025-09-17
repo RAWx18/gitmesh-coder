@@ -37,9 +37,12 @@ class VirtualFileSystemIO:
         self.virtual_fs = virtual_fs
         self.repo_root = Path(repo_root)
         
+        # Track modified files for PR creation
+        self.modified_files = {}
+        
         # Delegate all other attributes to the original IO
         for attr in dir(original_io):
-            if not attr.startswith('_') and attr not in ['read_text', 'read_image', 'get_mtime']:
+            if not attr.startswith('_') and attr not in ['read_text', 'read_image', 'get_mtime', 'write_text']:
                 setattr(self, attr, getattr(original_io, attr))
     
     def read_text(self, filename, silent=False):
@@ -124,6 +127,77 @@ class VirtualFileSystemIO:
             File content as string or None if not found
         """
         return self.read_text(filename, silent=True)
+    
+    def write_text(self, filename, content, encoding='utf-8'):
+        """
+        Write text to file and store modified content for PR creation.
+        
+        Args:
+            filename: Path to the file
+            content: Content to write
+            encoding: Text encoding (default: utf-8)
+        """
+        try:
+            # Write to actual filesystem first
+            result = self.original_io.write_text(filename, content, encoding)
+            
+            # Store modified content for PR creation
+            # Convert to relative path for consistent tracking
+            file_path = Path(filename)
+            if file_path.is_absolute():
+                try:
+                    rel_path = file_path.relative_to(self.repo_root)
+                    self.modified_files[str(rel_path)] = content
+                except ValueError:
+                    # Path is not relative to repo root, store as-is
+                    self.modified_files[str(filename)] = content
+            else:
+                self.modified_files[str(filename)] = content
+            
+            return result
+        except Exception as e:
+            logger.warning(f"Error writing file {filename}: {e}")
+            # Still store the content for PR creation even if write fails
+            file_path = Path(filename)
+            if file_path.is_absolute():
+                try:
+                    rel_path = file_path.relative_to(self.repo_root)
+                    self.modified_files[str(rel_path)] = content
+                except ValueError:
+                    self.modified_files[str(filename)] = content
+            else:
+                self.modified_files[str(filename)] = content
+            raise
+    
+    def get_modified_content(self, filename):
+        """
+        Get modified content for a file if it has been changed.
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            Modified content as string or None if not modified
+        """
+        # Try different path formats
+        paths_to_try = [str(filename)]
+        
+        file_path = Path(filename)
+        if file_path.is_absolute():
+            try:
+                rel_path = file_path.relative_to(self.repo_root)
+                paths_to_try.append(str(rel_path))
+            except ValueError:
+                pass
+        else:
+            abs_path = self.repo_root / filename
+            paths_to_try.append(str(abs_path))
+        
+        for path in paths_to_try:
+            if path in self.modified_files:
+                return self.modified_files[path]
+        
+        return None
     
     def get_mtime(self, filename):
         """
@@ -245,7 +319,9 @@ class RedisRepoManager:
                  attribute_commit_message_author=False,
                  attribute_commit_message_committer=False,
                  commit_prompt=None, subtree_only=False,
-                 git_commit_verify=True, attribute_co_authored_by=False):
+                 git_commit_verify=True, attribute_co_authored_by=False,
+                 create_pull_request=False, pr_base_branch='main', pr_draft=False,
+                 auto_cleanup=True, github_token=None):
         """
         Initialize RedisRepoManager with GitRepo-compatible interface.
         
@@ -266,6 +342,11 @@ class RedisRepoManager:
             subtree_only: Whether to use subtree only
             git_commit_verify: Whether to verify git commits
             attribute_co_authored_by: Whether to attribute co-authored by
+            create_pull_request: Whether to create pull requests instead of direct commits
+            pr_base_branch: Base branch for pull requests
+            pr_draft: Whether to create draft pull requests
+            auto_cleanup: Whether to automatically cleanup temporary files after operations
+            github_token: GitHub personal access token for PR operations
         """
         self.original_io = io
         self.models = models
@@ -284,6 +365,20 @@ class RedisRepoManager:
         self.subtree_only = subtree_only
         self.git_commit_verify = git_commit_verify
         self.ignore_file_cache = {}
+        
+        # PR-related attributes
+        self.create_pull_request = create_pull_request
+        self.pr_base_branch = pr_base_branch
+        self.pr_draft = pr_draft
+        self.github_token = github_token
+        
+        # PR creation tracking to prevent duplicates
+        self.pr_created_this_session = False
+        
+        # Cleanup attributes
+        self.auto_cleanup = auto_cleanup
+        self._extracted_files = set()
+        self._temp_dirs = set()
         
         # GitRepo compatibility - simulate repo object
         self.repo = None  # Will be set to self for compatibility
@@ -575,9 +670,17 @@ class RedisRepoManager:
                         # Ensure directory exists
                         local_file_path.parent.mkdir(parents=True, exist_ok=True)
                         
+                        # Track the directory for cleanup
+                        if self.auto_cleanup:
+                            self._temp_dirs.add(local_file_path.parent)
+                        
                         # Write file content
                         with open(local_file_path, 'w', encoding='utf-8') as f:
                             f.write(content)
+                        
+                        # Track the file for cleanup
+                        if self.auto_cleanup:
+                            self._extracted_files.add(local_file_path)
                             
                 except Exception as e:
                     logger.warning(f"Failed to extract file {file_path}: {e}")
@@ -621,9 +724,17 @@ class RedisRepoManager:
                         physical_path = repo_dir / file_path
                         physical_path.parent.mkdir(parents=True, exist_ok=True)
                         
+                        # Track the directory for cleanup
+                        if self.auto_cleanup:
+                            self._temp_dirs.add(physical_path.parent)
+                        
                         # Write content to disk
                         with open(physical_path, 'w', encoding='utf-8') as f:
                             f.write(content)
+                        
+                        # Track the file for cleanup
+                        if self.auto_cleanup:
+                            self._extracted_files.add(physical_path)
                         
                         files_extracted += 1
                         
@@ -653,6 +764,194 @@ class RedisRepoManager:
         if message:
             logger.info(f"Simulated commit for {self.repo_name}: {message}")
         return None
+
+    def commit_and_create_pr(self, fnames=None, context=None, message=None, cosmos_edits=False, coder=None):
+        """
+        Create a GitHub pull request for Redis-based repositories.
+        
+        Args:
+            fnames: List of filenames to commit
+            context: Commit context  
+            message: Commit message
+            cosmos_edits: Whether these are cosmos edits
+            coder: Coder instance
+            
+        Returns:
+            dict: Contains commit info and PR details if successful
+        """
+        # Check if PR was already created this session to prevent duplicates
+        if self.pr_created_this_session:
+            logger.info(f"PR already created this session for {self.repo_name}, skipping duplicate")
+            return {
+                'commit_hash': 'duplicate_pr_prevented',
+                'commit_message': message or f"Update files in {self.repo_name}",
+                'pr_info': {'duplicate': True}
+            }
+            
+        if not self.create_pull_request:
+            # If PR mode is disabled, just return a simulated commit
+            if message:
+                logger.info(f"Simulated commit for {self.repo_name}: {message}")
+            return {
+                'commit_hash': 'simulated_hash',
+                'commit_message': message or f"Update files in {self.repo_name}",
+                'pr_info': None
+            }
+        
+        # Check if we have GitHub token
+        github_token = self.github_token or os.getenv('GITHUB_TOKEN')
+        if not github_token:
+            self.original_io.tool_error("GitHub token required for PR creation. Set GITHUB_TOKEN environment variable or use --github-token")
+            return {
+                'commit_hash': 'error_no_token',
+                'commit_message': message or f"Update files in {self.repo_name}",
+                'pr_info': None
+            }
+        
+        # Import the GitHub PR module
+        try:
+            from cosmos.github_pr import create_pull_request_workflow
+        except ImportError as e:
+            self.original_io.tool_error(f"GitHub PR module not available: {e}")
+            return {
+                'commit_hash': 'error_no_module',
+                'commit_message': message or f"Update files in {self.repo_name}",
+                'pr_info': None
+            }
+        
+        # Generate commit message if not provided
+        if not message:
+            if context and coder:
+                try:
+                    # Get changed files for commit message generation
+                    changed_files = []
+                    if fnames:
+                        changed_files = [str(fname) for fname in fnames]
+                    
+                    message = self.get_commit_message(
+                        diffs="Changes made via cosmos chat",
+                        context=context,
+                        user_language=getattr(coder, 'commit_language', None)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to generate commit message: {e}")
+                    message = f"Update files in {self.repo_name}"
+            else:
+                message = f"Update files in {self.repo_name}"
+        
+        # Get list of changed files
+        changed_files = []
+        if fnames:
+            changed_files = [str(fname) for fname in fnames]
+        elif self.virtual_fs:
+            # Get all tracked files as potential changes
+            try:
+                changed_files = self.virtual_fs.get_tracked_files()[:10]  # Limit to first 10 files
+            except Exception as e:
+                logger.warning(f"Failed to get changed files: {e}")
+                changed_files = ["Updated files"]
+        
+        try:
+            # Create the pull request using the workflow
+            pr_info = create_pull_request_workflow(
+                repo=self,
+                commit_message=message,
+                changed_files=changed_files,
+                io=self.original_io,
+                base_branch=self.pr_base_branch,
+                draft=self.pr_draft,
+                github_token=github_token
+            )
+            
+            if pr_info:
+                # Mark that PR was created successfully
+                self.pr_created_this_session = True
+                
+                commit_hash = f"pr_{pr_info.get('number', 'unknown')}"
+                result = {
+                    'commit_hash': commit_hash,
+                    'commit_message': message,
+                    'pr_info': pr_info
+                }
+                
+                # Log successful PR creation
+                logger.info(f"Created PR #{pr_info.get('number')} for {self.repo_name}: {message}")
+                
+                return result
+            else:
+                self.original_io.tool_error("Failed to create pull request")
+                return {
+                    'commit_hash': 'error_pr_failed',
+                    'commit_message': message,
+                    'pr_info': None
+                }
+                
+        except Exception as e:
+            error_msg = f"Error creating pull request: {str(e)}"
+            logger.error(error_msg)
+            self.original_io.tool_error(error_msg)
+            return {
+                'commit_hash': 'error_exception',
+                'commit_message': message,
+                'pr_info': None
+            }
+    
+    def get_file_content_for_pr(self, file_path: str) -> Optional[str]:
+        """
+        Get file content for PR creation, prioritizing modified content.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            File content as string, or None if not found
+        """
+        try:
+            # First check if we have modified content from VirtualFileSystemIO
+            if hasattr(self, 'io') and hasattr(self.io, 'get_modified_content'):
+                modified_content = self.io.get_modified_content(file_path)
+                if modified_content is not None:
+                    logger.debug(f"Found modified content for {file_path}")
+                    return modified_content
+            
+            # Try to read from physical filesystem (where edits are written)
+            try:
+                physical_path = Path(self.root) / file_path
+                if physical_path.exists():
+                    with open(physical_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    logger.debug(f"Read content from physical file: {file_path}")
+                    return content
+            except Exception as e:
+                logger.debug(f"Could not read from physical file {file_path}: {e}")
+            
+            # Try virtual filesystem as fallback
+            if self.virtual_fs:
+                content = self.virtual_fs.extract_file_with_context(file_path)
+                if content is not None:
+                    logger.debug(f"Read content from virtual filesystem: {file_path}")
+                    return content
+            
+            # Try content indexer as last resort
+            if self.content_indexer:
+                content = self.content_indexer.get_file_content(file_path)
+                if content is not None:
+                    logger.debug(f"Read content from content indexer: {file_path}")
+                    return content
+            
+            # Try IO wrapper
+            if hasattr(self, 'io'):
+                content = self.io.read_text(file_path, silent=True)
+                if content is not None:
+                    logger.debug(f"Read content from IO wrapper: {file_path}")
+                    return content
+            
+            logger.warning(f"Could not get content for file: {file_path}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting file content for {file_path}: {e}")
+            return None
     
     def get_rel_repo_dir(self) -> str:
         """Get relative repository directory."""
@@ -1935,3 +2234,70 @@ class RedisRepoManager:
             results['errors'].append(f"Verification failed: {e}")
         
         return results
+    
+    # Cleanup methods
+    
+    def cleanup_extracted_files(self) -> None:
+        """
+        Clean up all extracted temporary files and directories.
+        
+        This method removes all files and directories that were created
+        during the file extraction process.
+        """
+        if not self.auto_cleanup:
+            logger.debug("Auto cleanup is disabled")
+            return
+        
+        try:
+            # Remove extracted files
+            files_removed = 0
+            for file_path in self._extracted_files:
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        files_removed += 1
+                        logger.debug(f"Removed extracted file: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove file {file_path}: {e}")
+            
+            # Remove empty directories (in reverse order to remove nested dirs first)
+            dirs_removed = 0
+            sorted_dirs = sorted(self._temp_dirs, key=lambda x: str(x), reverse=True)
+            for dir_path in sorted_dirs:
+                try:
+                    if dir_path.exists() and dir_path.is_dir():
+                        # Only remove if directory is empty
+                        if not any(dir_path.iterdir()):
+                            dir_path.rmdir()
+                            dirs_removed += 1
+                            logger.debug(f"Removed empty directory: {dir_path}")
+                except Exception as e:
+                    logger.debug(f"Could not remove directory {dir_path}: {e}")
+            
+            # Clear tracking sets
+            self._extracted_files.clear()
+            self._temp_dirs.clear()
+            
+            if files_removed > 0 or dirs_removed > 0:
+                logger.info(f"Cleanup complete: removed {files_removed} files and {dirs_removed} directories")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - performs automatic cleanup."""
+        if self.auto_cleanup:
+            self.cleanup_extracted_files()
+        
+    def __del__(self):
+        """Destructor - performs cleanup if auto_cleanup is enabled."""
+        try:
+            if hasattr(self, 'auto_cleanup') and self.auto_cleanup:
+                self.cleanup_extracted_files()
+        except Exception:
+            # Suppress all exceptions in destructor
+            pass

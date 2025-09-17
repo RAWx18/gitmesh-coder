@@ -22,6 +22,7 @@ from cosmos import prompts, utils
 
 from .dump import dump  # noqa: F401
 from .waiting import WaitingSpinner
+from .github_pr import create_pull_request_workflow
 
 ANY_GIT_ERROR += [
     OSError,
@@ -74,6 +75,9 @@ class GitRepo:
         subtree_only=False,
         git_commit_verify=True,
         attribute_co_authored_by=False,  # Added parameter
+        create_pull_request=False,  # New parameter for PR mode
+        pr_base_branch='main',  # Base branch for PRs
+        pr_draft=False,  # Whether to create draft PRs
     ):
         self.io = io
         self.models = models
@@ -90,6 +94,11 @@ class GitRepo:
         self.subtree_only = subtree_only
         self.git_commit_verify = git_commit_verify
         self.ignore_file_cache = {}
+        
+        # PR-related attributes
+        self.create_pull_request = create_pull_request
+        self.pr_base_branch = pr_base_branch
+        self.pr_draft = pr_draft
 
         if git_dname:
             check_fnames = [git_dname]
@@ -316,6 +325,73 @@ class GitRepo:
         except ANY_GIT_ERROR as err:
             self.io.tool_error(f"Unable to commit: {err}")
             # No return here, implicitly returns None
+
+    def commit_and_create_pr(self, fnames=None, context=None, message=None, cosmos_edits=False, coder=None):
+        """
+        Commit changes and optionally create a pull request.
+        
+        This method extends the normal commit workflow to support creating pull requests
+        when self.create_pull_request is True.
+        
+        Args:
+            fnames: List of filenames to commit
+            context: Context for generating commit message
+            message: Explicit commit message
+            cosmos_edits: Whether changes were made by cosmos
+            coder: The Coder instance
+            
+        Returns:
+            dict: Contains 'commit_hash', 'commit_message', and optionally 'pr_info'
+        """
+        result = {}
+        
+        # First, perform the normal commit
+        commit_result = self.commit(fnames, context, message, cosmos_edits, coder)
+        if not commit_result:
+            return None
+            
+        commit_hash, commit_message = commit_result
+        result['commit_hash'] = commit_hash
+        result['commit_message'] = commit_message
+        
+        # If PR mode is enabled, create a pull request
+        if self.create_pull_request:
+            try:
+                # Get the list of changed files for PR description
+                changed_files = []
+                if fnames:
+                    changed_files = [str(fname) for fname in fnames]
+                else:
+                    # Get all dirty files if none specified
+                    try:
+                        if self.repo.is_dirty():
+                            changed_files = [item.a_path for item in self.repo.index.diff(None)]
+                            changed_files.extend([item.a_path for item in self.repo.index.diff("HEAD")])
+                            changed_files = list(set(changed_files))  # Remove duplicates
+                    except ANY_GIT_ERROR:
+                        pass
+                
+                # Create the pull request
+                pr_info = create_pull_request_workflow(
+                    repo=self,
+                    commit_message=commit_message,
+                    changed_files=changed_files,
+                    io=self.io,
+                    base_branch=self.pr_base_branch,
+                    draft=self.pr_draft
+                )
+                
+                if pr_info:
+                    result['pr_info'] = pr_info
+                    self.io.tool_output("Pull request created successfully!", bold=True)
+                else:
+                    self.io.tool_warning("Failed to create pull request, but commit was successful")
+                    
+            except Exception as e:
+                self.io.tool_error(f"Failed to create pull request: {e}")
+                self.io.tool_output("Commit was successful, but PR creation failed")
+        
+        return result
 
     def get_rel_repo_dir(self):
         try:

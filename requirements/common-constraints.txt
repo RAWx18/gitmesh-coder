@@ -63,7 +63,7 @@ click==8.2.1
     #   typer
 codespell==2.4.1
     # via -r requirements/requirements-dev.in
-cogapp==3.5.1
+cogapp
     # via -r requirements/requirements-dev.in
 colorama==0.4.6
     # via griffe

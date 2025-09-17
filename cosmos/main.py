@@ -622,6 +622,9 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     if args.openai_api_key:
         os.environ["OPENAI_API_KEY"] = args.openai_api_key
 
+    if args.github_token:
+        os.environ["GITHUB_TOKEN"] = args.github_token
+
     # Handle deprecated model shortcut args
     handle_deprecated_model_args(args, io)
     if args.openai_api_base:
@@ -1142,7 +1145,12 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                 git_commit_verify=args.git_commit_verify,
                 attribute_co_authored_by=args.attribute_co_authored_by,
                 repo_url=actual_repo_url,  # Pass the actual repository URL/name
-                force_redis=True  # Force Redis mode
+                force_redis=True,  # Force Redis mode
+                create_pull_request=args.create_pull_request,
+                pr_base_branch=args.pr_base_branch,
+                pr_draft=args.pr_draft,
+                auto_cleanup=not args.no_auto_cleanup,
+                github_token=args.github_token
             )
             io.tool_output("Working with Redis-cached repository")
         except Exception as e:

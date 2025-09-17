@@ -351,7 +351,79 @@ class Commands:
             return
 
         commit_message = args.strip() if args else None
-        self.coder.repo.commit(message=commit_message, coder=self.coder)
+        
+        # Use commit_and_create_pr if PR mode is enabled and the method exists
+        if (hasattr(self.coder.repo, 'create_pull_request') and 
+            self.coder.repo.create_pull_request and
+            hasattr(self.coder.repo, 'commit_and_create_pr')):
+            result = self.coder.repo.commit_and_create_pr(message=commit_message, coder=self.coder)
+            if result and result.get('pr_info'):
+                self.io.tool_output("Created pull request successfully!")
+        else:
+            self.coder.repo.commit(message=commit_message, coder=self.coder)
+
+    def cmd_pr(self, args=""):
+        """Enable/disable GitHub pull request mode or show current status"""
+        
+        if not self.coder.repo:
+            self.io.tool_error("No git repository found.")
+            return
+            
+        args = args.strip().lower()
+        
+        if args == "on" or args == "enable":
+            if hasattr(self.coder.repo, 'create_pull_request'):
+                self.coder.repo.create_pull_request = True
+                self.io.tool_output("✅ Pull request mode enabled")
+                self.io.tool_output(f"Base branch: {getattr(self.coder.repo, 'pr_base_branch', 'main')}")
+                self.io.tool_output(f"Draft PRs: {'Yes' if getattr(self.coder.repo, 'pr_draft', False) else 'No'}")
+                self.io.tool_output("Future commits will create pull requests instead of committing directly")
+            else:
+                self.io.tool_error("Pull request mode not supported in this repository type")
+                
+        elif args == "off" or args == "disable":
+            if hasattr(self.coder.repo, 'create_pull_request'):
+                self.coder.repo.create_pull_request = False
+                self.io.tool_output("❌ Pull request mode disabled")
+                self.io.tool_output("Future commits will commit directly to the current branch")
+            else:
+                self.io.tool_error("Pull request mode not supported in this repository type")
+                
+        elif args.startswith("base "):
+            # Set base branch
+            base_branch = args[5:].strip()
+            if hasattr(self.coder.repo, 'pr_base_branch'):
+                self.coder.repo.pr_base_branch = base_branch
+                self.io.tool_output(f"Set PR base branch to: {base_branch}")
+            else:
+                self.io.tool_error("Pull request mode not supported in this repository type")
+                
+        elif args == "draft":
+            # Toggle draft mode
+            if hasattr(self.coder.repo, 'pr_draft'):
+                self.coder.repo.pr_draft = not self.coder.repo.pr_draft
+                status = "enabled" if self.coder.repo.pr_draft else "disabled"
+                self.io.tool_output(f"Draft PR mode {status}")
+            else:
+                self.io.tool_error("Pull request mode not supported in this repository type")
+                
+        else:
+            # Show current status
+            if hasattr(self.coder.repo, 'create_pull_request'):
+                status = "enabled" if self.coder.repo.create_pull_request else "disabled"
+                self.io.tool_output(f"Pull request mode: {status}")
+                if hasattr(self.coder.repo, 'pr_base_branch'):
+                    self.io.tool_output(f"Base branch: {self.coder.repo.pr_base_branch}")
+                if hasattr(self.coder.repo, 'pr_draft'):
+                    self.io.tool_output(f"Draft PRs: {'Yes' if self.coder.repo.pr_draft else 'No'}")
+                
+                self.io.tool_output("\nUsage:")
+                self.io.tool_output("  /pr on          - Enable PR mode")
+                self.io.tool_output("  /pr off         - Disable PR mode")
+                self.io.tool_output("  /pr base main   - Set base branch")
+                self.io.tool_output("  /pr draft       - Toggle draft mode")
+            else:
+                self.io.tool_error("Pull request mode not supported in this repository type")
 
     def cmd_lint(self, args="", fnames=None):
         "Lint and fix in-chat files or all dirty files if none in chat"
@@ -1050,6 +1122,23 @@ class Commands:
     def cmd_quit(self, args):
         "Exit the application"
         self.cmd_exit(args)
+
+    def cmd_cleanup(self, args):
+        "Clean up temporary files created during repository operations"
+        
+        # Check if we have a Redis repo manager with cleanup capability
+        repo = getattr(self.coder, 'repo', None)
+        if repo and hasattr(repo, 'cleanup_extracted_files'):
+            try:
+                repo.cleanup_extracted_files()
+                self.io.tool_output("✅ Cleanup completed successfully")
+                return "Temporary files have been cleaned up."
+            except Exception as e:
+                self.io.tool_error(f"❌ Cleanup failed: {e}")
+                return f"Cleanup failed: {e}"
+        else:
+            self.io.tool_output("ℹ️  No cleanup needed for this repository type")
+            return "No cleanup needed - this repository type doesn't use temporary files."
 
     def cmd_ls(self, args):
         "List all known files and indicate which are included in the chat session"
