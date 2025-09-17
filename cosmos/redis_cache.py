@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 
 # Import the production-ready configuration
-from .config import get_config, RedisCloudConfig
-from .monitoring import MonitoredOperation, get_system_monitor
+try:
+    from .config import get_config, RedisCloudConfig
+    from .monitoring import MonitoredOperation, get_system_monitor
+except ImportError:
+    from config import get_config, RedisCloudConfig
+    from monitoring import MonitoredOperation, get_system_monitor
 
 
 class RetryConfig:

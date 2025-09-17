@@ -38,7 +38,10 @@ from cosmos.report import report_uncaught_exceptions
 from cosmos.versioncheck import check_version, install_from_main_branch, install_upgrade
 from cosmos.watch import FileWatcher
 
-from .dump import dump  # noqa: F401
+try:
+    from .dump import dump  # noqa: F401
+except ImportError:
+    from dump import dump  # noqa: F401
 
 
 def check_config_files_for_yes(config_files):
@@ -713,14 +716,64 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                     io.tool_output(f"  [{i}] {repo['name']} (cached: {stored_time})")
                 
                 io.tool_output(f"  [N] Fetch new GitHub repository")
+                io.tool_output(f"  [D] Delete a cached repository")
                 io.tool_output()
                 
                 choice = io.prompt_ask(
-                    f"Select repository (1-{len(cached_repos)}) or N for new:",
+                    f"Select repository (1-{len(cached_repos)}), N for new, or D to delete:",
                     default="1"
                 ).strip().upper()
                 
-                if choice == 'N':
+                if choice == 'D':
+                    # Delete a cached repository
+                    delete_choice = io.prompt_ask(
+                        f"Select repository to delete (1-{len(cached_repos)}):",
+                        default=""
+                    ).strip()
+                    
+                    try:
+                        delete_index = int(delete_choice) - 1
+                        if 0 <= delete_index < len(cached_repos):
+                            repo_to_delete = cached_repos[delete_index]
+                            repo_name = repo_to_delete['name']
+                            
+                            confirm = io.prompt_ask(
+                                f"Are you sure you want to delete '{repo_name}' from cache? (y/N):",
+                                default="N"
+                            ).strip().upper()
+                            
+                            if confirm == 'Y':
+                                if cache.smart_invalidate(repo_name):
+                                    io.tool_output(f"Successfully deleted '{repo_name}' from cache.")
+                                    
+                                    # Also delete local cache files if they exist
+                                    import shutil
+                                    local_cache_dir = f"/tmp/repo_storage/{repo_name}"
+                                    if os.path.exists(local_cache_dir):
+                                        shutil.rmtree(local_cache_dir)
+                                        io.tool_output(f"Deleted local cache files for '{repo_name}'.")
+                                    
+                                    # Restart the selection process
+                                    analytics.event("exit", reason="Repository deleted - restarting")
+                                    return main(argv, input, output, force_git_root, return_coder)
+                                else:
+                                    io.tool_error(f"Failed to delete '{repo_name}' from cache.")
+                                    analytics.event("exit", reason="Failed to delete repository")
+                                    return 1
+                            else:
+                                io.tool_output("Delete cancelled.")
+                                # Restart the selection process
+                                analytics.event("exit", reason="Delete cancelled - restarting")
+                                return main(argv, input, output, force_git_root, return_coder)
+                        else:
+                            io.tool_error("Invalid selection.")
+                            analytics.event("exit", reason="Invalid delete selection")
+                            return 1
+                    except ValueError:
+                        io.tool_error("Invalid selection. Please enter a number.")
+                        analytics.event("exit", reason="Invalid delete selection format")
+                        return 1
+                elif choice == 'N':
                     # Fetch new repository
                     repo_url = io.prompt_ask(
                         "Enter GitHub repository URL:",

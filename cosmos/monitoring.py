@@ -21,7 +21,10 @@ try:
 except ImportError:
     redis = None
 
-from .config import get_config
+try:
+    from .config import get_config
+except ImportError:
+    from config import get_config
 
 
 # Configure structured logging

@@ -335,7 +335,9 @@ class SystemConfig:
     def __post_init__(self):
         """Validate system configuration."""
         valid_tiers = ['free', 'pro', 'enterprise']
-        if self.user_tier.lower() not in valid_tiers:
+        # Clean up the tier value (remove quotes and whitespace)
+        self.user_tier = self.user_tier.strip().strip('"').strip("'").lower()
+        if self.user_tier not in valid_tiers:
             raise ConfigurationError(f"user_tier must be one of: {valid_tiers}")
         
         valid_log_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']

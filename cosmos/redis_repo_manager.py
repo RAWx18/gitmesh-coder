@@ -54,34 +54,41 @@ class VirtualFileSystemIO:
         """
         try:
             # First try to read from the actual filesystem
-            return self.original_io.read_text(filename, silent=True)
+            result = self.original_io.read_text(filename, silent=True)
+            if result is not None:
+                return result
         except (FileNotFoundError, OSError):
-            # If file doesn't exist on disk, try virtual filesystem
-            if self.virtual_fs:
-                try:
-                    # Convert absolute path to relative path for virtual filesystem
-                    file_path = Path(filename)
-                    if file_path.is_absolute():
-                        try:
-                            rel_path = file_path.relative_to(self.repo_root)
-                            content = self.virtual_fs.extract_file_with_context(str(rel_path))
-                            if content:
-                                return content
-                        except ValueError:
-                            # Path is not relative to repo root, try as-is
-                            pass
+            pass
+        
+        # If file doesn't exist on disk, try virtual filesystem
+        if self.virtual_fs:
+            try:
+                # Convert absolute path to relative path for virtual filesystem
+                file_path = Path(filename)
+                if file_path.is_absolute():
+                    try:
+                        rel_path = file_path.relative_to(self.repo_root)
+                        content = self.virtual_fs.extract_file_with_context(str(rel_path))
+                        if content is not None:
+                            return content
+                    except ValueError:
+                        # Path is not relative to repo root, try as-is
+                        pass
+                
+                # Try the path as-is
+                content = self.virtual_fs.extract_file_with_context(str(filename))
+                if content is not None:
+                    return content
                     
-                    # Try the path as-is
-                    content = self.virtual_fs.extract_file_with_context(str(filename))
-                    if content:
-                        return content
-                        
-                except Exception as e:
-                    if not silent:
-                        logger.warning(f"Error reading from virtual filesystem {filename}: {e}")
-            
-            # If all else fails, use original IO (which will show appropriate error)
+            except Exception as e:
+                if not silent:
+                    logger.warning(f"Error reading from virtual filesystem {filename}: {e}")
+        
+        # If all else fails, use original IO (which will show appropriate error)
+        try:
             return self.original_io.read_text(filename, silent)
+        except:
+            return None
     
     def read_image(self, filename):
         """
@@ -100,6 +107,18 @@ class VirtualFileSystemIO:
             # For now, images are not supported in virtual filesystem
             # Could be extended in the future if needed
             return self.original_io.read_image(filename)
+    
+    def get_file_content(self, filename):
+        """
+        Get file content from virtual filesystem - alias for read_text.
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            File content as string or None if not found
+        """
+        return self.read_text(filename, silent=True)
 
 logger = logging.getLogger(__name__)
 
@@ -177,10 +196,11 @@ class RedisRepoManager:
         self.virtual_fs = None
         self.repo_name = self._extract_repo_name(repo_url)
         
-        # Set up virtual root path - use temp directory for cache files
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-        self.root = utils.safe_abs_path(f"{temp_dir}/cosmos_redis_cache/{self.repo_name}")
+        # Set up virtual root path - use current working directory with repo-specific subdirectory
+        # This allows repo-map to create its cache files properly
+        current_dir = Path.cwd()
+        safe_repo_name = self.repo_name.replace('/', '_').replace(':', '_')
+        self.root = utils.safe_abs_path(f"{current_dir}/.redis_repos/{safe_repo_name}")
         
         # Ensure the directory exists for cache files
         os.makedirs(self.root, exist_ok=True)
@@ -193,6 +213,9 @@ class RedisRepoManager:
         
         # Load repository data from Redis
         self._load_repository_data()
+        
+        # Extract files to local directory for repo-map compatibility
+        self._extract_files_to_local()
         
         # Set up virtual filesystem IO wrapper
         self.io = VirtualFileSystemIO(self.original_io, self.virtual_fs, self.root)
@@ -292,6 +315,39 @@ class RedisRepoManager:
             logger.error(f"Error loading repository data for {self.repo_name}: {e}")
             # Initialize empty virtual filesystem as fallback
             self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+    
+    def _extract_files_to_local(self) -> None:
+        """Extract files from virtual filesystem to local directory for repo-map compatibility."""
+        if not self.virtual_fs:
+            return
+        
+        try:
+            # Get all tracked files
+            tracked_files = self.virtual_fs.get_tracked_files()
+            
+            for file_path in tracked_files:
+                try:
+                    # Get file content from virtual filesystem
+                    content = self.virtual_fs.extract_file_with_context(file_path)
+                    if content is not None:
+                        # Create local file path
+                        local_file_path = Path(self.root) / file_path
+                        
+                        # Ensure directory exists
+                        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # Write file content
+                        with open(local_file_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                            
+                except Exception as e:
+                    logger.warning(f"Failed to extract file {file_path}: {e}")
+                    continue
+            
+            logger.info(f"Extracted {len(tracked_files)} files to local directory for repo-map")
+            
+        except Exception as e:
+            logger.error(f"Error extracting files to local directory: {e}")
     
     def _extract_files_to_disk(self) -> None:
         """
@@ -510,8 +566,9 @@ class RedisRepoManager:
         if not self.virtual_fs:
             return False
         
-        normalized_path = self.normalize_path(path)
-        return self.virtual_fs.file_exists(normalized_path)
+        # Try both the original path and normalized path
+        return (self.virtual_fs.file_exists(path) or 
+                self.virtual_fs.file_exists(self.normalize_path(path)))
     
     def abs_root_path(self, path: str) -> Path:
         """
@@ -597,7 +654,7 @@ class RedisRepoManager:
         
         try:
             content = self.virtual_fs.extract_file_with_context(file_path)
-            return content if content else ""
+            return content if content is not None else ""
         except Exception as e:
             logger.warning(f"Could not read file {file_path}: {e}")
             return ""
@@ -787,6 +844,21 @@ class RedisRepoManager:
         except Exception as e:
             logger.warning(f"Could not walk directory {top_dir}: {e}")
             return []
+    
+    def file_exists(self, file_path: str) -> bool:
+        """
+        Check if file exists in virtual filesystem.
+        
+        Args:
+            file_path: Path to check
+            
+        Returns:
+            True if file exists
+        """
+        if not self.virtual_fs:
+            return False
+        
+        return self.virtual_fs.file_exists(file_path)
     
     def cosmos_relative_to(self, path: str, base_path: str = None) -> str:
         """

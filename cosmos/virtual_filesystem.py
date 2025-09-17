@@ -13,7 +13,10 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 
-from .content_indexer import ContentIndexer
+try:
+    from .content_indexer import ContentIndexer
+except ImportError:
+    from content_indexer import ContentIndexer
 
 logger = logging.getLogger(__name__)
 
@@ -146,30 +149,19 @@ class IntelligentVirtualFileSystem:
         
         logger.info(f"Parsed {len(self._files)} files from content.md")
     
-    def extract_file_with_context(self, file_path: str) -> Optional[str]:
+
+    
+    def get_file_content(self, file_path: str) -> Optional[str]:
         """
-        Extract file content efficiently using indexing system.
+        Get file content - alias for extract_file_with_context for compatibility.
         
         Args:
-            file_path: Path to the file to extract
+            file_path: Path to the file
             
         Returns:
             File content as string, or None if file not found
         """
-        # First try indexed access
-        if self.indexer:
-            content = self.indexer.get_file_content(file_path)
-            if content is not None:
-                # Cache the content for future access
-                self._files[file_path] = content
-                return content
-        
-        # Fallback to cached content from full parsing
-        if file_path in self._files:
-            return self._files[file_path]
-        
-        # File not found
-        return None
+        return self.extract_file_with_context(file_path)
     
     def file_exists(self, file_path: str) -> bool:
         """
@@ -181,10 +173,30 @@ class IntelligentVirtualFileSystem:
         Returns:
             True if file exists
         """
-        if self.indexer:
-            return self.indexer.file_exists(file_path)
+        # Normalize path separators
+        normalized_path = file_path.replace('\\', '/')
         
-        return file_path in self._files
+        if self.indexer:
+            # Try exact match first
+            if self.indexer.file_exists(normalized_path):
+                return True
+            
+            # Try without leading slash
+            if normalized_path.startswith('/'):
+                alt_path = normalized_path[1:]
+                if self.indexer.file_exists(alt_path):
+                    return True
+            
+            # Try with leading slash
+            if not normalized_path.startswith('/'):
+                alt_path = '/' + normalized_path
+                if self.indexer.file_exists(alt_path):
+                    return True
+        
+        # Fallback to cached files
+        return (normalized_path in self._files or 
+                (normalized_path.startswith('/') and normalized_path[1:] in self._files) or
+                (not normalized_path.startswith('/') and '/' + normalized_path in self._files))
     
     def get_tracked_files(self) -> List[str]:
         """
@@ -341,20 +353,28 @@ class IntelligentVirtualFileSystem:
                 'path': file_path
             }
     
-    def extract_file_with_context(self, file_path: str) -> str:
+    def extract_file_with_context(self, file_path: str) -> Optional[str]:
         """
-        Extract file content with surrounding context for cosmos operations.
+        Extract file content efficiently using indexing system.
         
         Args:
             file_path: Path to the file to extract
             
         Returns:
-            File content as string, or empty string if not found
+            File content as string, or None if file not found
         """
         # Normalize path separators
         normalized_path = file_path.replace('\\', '/')
         
-        # Try exact match first
+        # First try indexed access
+        if self.indexer:
+            content = self.indexer.get_file_content(normalized_path)
+            if content is not None:
+                # Cache the content for future access
+                self._files[normalized_path] = content
+                return content
+        
+        # Try exact match first in cached files
         if normalized_path in self._files:
             return self._files[normalized_path]
         
@@ -363,15 +383,27 @@ class IntelligentVirtualFileSystem:
             alt_path = normalized_path[1:]
             if alt_path in self._files:
                 return self._files[alt_path]
+            # Also try indexed access with alt_path
+            if self.indexer:
+                content = self.indexer.get_file_content(alt_path)
+                if content is not None:
+                    self._files[alt_path] = content
+                    return content
         
         # Try with leading slash
         if not normalized_path.startswith('/'):
             alt_path = '/' + normalized_path
             if alt_path in self._files:
                 return self._files[alt_path]
+            # Also try indexed access with alt_path
+            if self.indexer:
+                content = self.indexer.get_file_content(alt_path)
+                if content is not None:
+                    self._files[alt_path] = content
+                    return content
         
         logger.warning(f"File not found: {file_path} in {self.repo_name}")
-        return ""
+        return None
     
     def get_cosmos_compatible_tree(self) -> Dict[str, Any]:
         """
@@ -452,18 +484,7 @@ class IntelligentVirtualFileSystem:
         """
         return list(self._tracked_files)
     
-    def file_exists(self, file_path: str) -> bool:
-        """
-        Check if a file exists in the virtual filesystem.
-        
-        Args:
-            file_path: Path to check
-            
-        Returns:
-            True if file exists, False otherwise
-        """
-        normalized_path = self.resolve_cosmos_path(file_path)
-        return normalized_path in self._files
+
     
     def is_directory(self, path: str) -> bool:
         """
