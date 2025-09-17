@@ -33,6 +33,7 @@ from cosmos.llm import litellm  # noqa: F401; properly init litellm on launch
 from cosmos.models import ModelSettings
 from cosmos.onboarding import offer_openrouter_oauth, select_default_model
 from cosmos.repo import ANY_GIT_ERROR, GitRepo
+from cosmos.repo_factory import create_repo
 from cosmos.report import report_uncaught_exceptions
 from cosmos.versioncheck import check_version, install_from_main_branch, install_upgrade
 from cosmos.watch import FileWatcher
@@ -70,7 +71,7 @@ def guessed_wrong_repo(io, git_root, fnames, git_dname):
     """After we parse the args, we can determine the real repo. Did we guess wrong?"""
 
     try:
-        check_repo = Path(GitRepo(io, fnames, git_dname).root).resolve()
+        check_repo = Path(create_repo(io, fnames, git_dname).root).resolve()
     except (OSError,) + ANY_GIT_ERROR:
         return
 
@@ -585,6 +586,10 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         io = get_io(False)
         io.tool_warning("Terminal does not support pretty output (UnicodeDecodeError)")
 
+    # Placeholder for repository selection - will be done after analytics initialization
+    redis_repo_url = None
+    git_root = None  # Disable local git since we're only using Redis repositories
+
     # Process any environment variables set via --set-env
     if args.set_env:
         for env_setting in args.set_env:
@@ -661,6 +666,167 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
 
     analytics.event("launched")
 
+    # GitHub repository selection - Redis mode only
+    try:
+        from cosmos.repo_factory import is_redis_mode_available
+        redis_available = is_redis_mode_available()
+        
+        if args.verbose:
+            io.tool_output(f"Redis mode available: {redis_available}")
+            
+        if not redis_available:
+            io.tool_error("Redis is not configured. This version requires Redis for GitHub repository caching.")
+            io.tool_output("Please configure Redis by setting the REDIS_URL environment variable.")
+            io.tool_output("Example: REDIS_URL=rediss://your-redis-cloud-url:port")
+            analytics.event("exit", reason="Redis not configured")
+            return 1
+            
+        # Initialize Redis configuration
+        try:
+            from cosmos.config import initialize_configuration
+            initialize_configuration()
+        except Exception as e:
+            io.tool_error(f"Failed to initialize Redis configuration: {e}")
+            io.tool_output("Please check your Redis configuration and try again.")
+            analytics.event("exit", reason="Redis config initialization failed")
+            return 1
+            
+        # Redis is available - check for cached repositories
+        try:
+            from cosmos.redis_cache import SmartRedisCache
+            cache = SmartRedisCache()
+            cached_repos = cache.list_cached_repositories()
+            
+            if cached_repos:
+                io.tool_output("Found cached GitHub repositories:")
+                io.tool_output()
+                
+                # Display cached repositories
+                for i, repo in enumerate(cached_repos, 1):
+                    stored_time = repo.get('stored_at', 'unknown')
+                    if stored_time != 'unknown':
+                        try:
+                            import datetime
+                            stored_time = datetime.datetime.fromtimestamp(float(stored_time)).strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            pass
+                    io.tool_output(f"  [{i}] {repo['name']} (cached: {stored_time})")
+                
+                io.tool_output(f"  [N] Fetch new GitHub repository")
+                io.tool_output()
+                
+                choice = io.prompt_ask(
+                    f"Select repository (1-{len(cached_repos)}) or N for new:",
+                    default="1"
+                ).strip().upper()
+                
+                if choice == 'N':
+                    # Fetch new repository
+                    repo_url = io.prompt_ask(
+                        "Enter GitHub repository URL:",
+                        default=""
+                    ).strip()
+                    
+                    if repo_url:
+                        if 'github.com' in repo_url and len(repo_url.split('/')) >= 5:
+                            io.tool_output(f"Fetching repository: {repo_url}")
+                            
+                            try:
+                                from cosmos.repo_fetch import fetch_and_store_repo
+                                if fetch_and_store_repo(repo_url):
+                                    redis_repo_url = repo_url
+                                    io.tool_output("Repository successfully cached in Redis.")
+                                    io.tool_output("Proceeding with Redis-cached repository...")
+                                else:
+                                    io.tool_error("Failed to fetch repository from GitHub")
+                                    analytics.event("exit", reason="Failed to fetch repository")
+                                    return 1
+                            except Exception as e:
+                                io.tool_error(f"Error fetching repository: {e}")
+                                analytics.event("exit", reason="Repository fetch error")
+                                return 1
+                        else:
+                            io.tool_error("Invalid GitHub URL format. Please provide a valid GitHub repository URL.")
+                            io.tool_output("Example: https://github.com/user/repository")
+                            analytics.event("exit", reason="Invalid GitHub URL")
+                            return 1
+                    else:
+                        io.tool_error("No repository URL provided.")
+                        analytics.event("exit", reason="No repository URL")
+                        return 1
+                else:
+                    # Use cached repository
+                    try:
+                        repo_index = int(choice) - 1
+                        if 0 <= repo_index < len(cached_repos):
+                            selected_repo = cached_repos[repo_index]
+                            redis_repo_url = f"cached:{selected_repo['name']}"
+                            io.tool_output(f"Using cached repository: {selected_repo['name']}")
+                            io.tool_output("Proceeding with Redis-cached repository...")
+                        else:
+                            io.tool_error("Invalid selection. Please select a valid repository number.")
+                            analytics.event("exit", reason="Invalid repository selection")
+                            return 1
+                    except ValueError:
+                        io.tool_error("Invalid selection. Please enter a number or 'N'.")
+                        analytics.event("exit", reason="Invalid selection format")
+                        return 1
+            else:
+                # No cached repositories - ask for new repository URL
+                io.tool_output("No cached repositories found.")
+                io.tool_output("Please provide a GitHub repository URL to get started.")
+                io.tool_output()
+                
+                repo_url = io.prompt_ask(
+                    "Enter GitHub repository URL:",
+                    default=""
+                ).strip()
+                
+                if not repo_url:
+                    io.tool_error("No repository URL provided. Cannot proceed without a repository.")
+                    analytics.event("exit", reason="No repository URL provided")
+                    return 1
+                
+                # Validate URL format
+                if 'github.com' not in repo_url or len(repo_url.split('/')) < 5:
+                    io.tool_error("Invalid GitHub URL format. Please provide a valid GitHub repository URL.")
+                    io.tool_output("Example: https://github.com/user/repository")
+                    analytics.event("exit", reason="Invalid GitHub URL format")
+                    return 1
+                
+                io.tool_output(f"Fetching repository: {repo_url}")
+                
+                try:
+                    from cosmos.repo_fetch import fetch_and_store_repo
+                    if fetch_and_store_repo(repo_url):
+                        redis_repo_url = repo_url
+                        io.tool_output("Repository successfully cached in Redis.")
+                        io.tool_output("Proceeding with Redis-cached repository...")
+                    else:
+                        io.tool_error("Failed to fetch repository from GitHub")
+                        analytics.event("exit", reason="Failed to fetch repository")
+                        return 1
+                except Exception as e:
+                    io.tool_error(f"Error fetching repository: {e}")
+                    analytics.event("exit", reason="Repository fetch error")
+                    return 1
+                    
+        except Exception as e:
+            io.tool_error(f"Error accessing Redis cache: {e}")
+            io.tool_output("Please check your Redis configuration and try again.")
+            analytics.event("exit", reason="Redis cache error")
+            return 1
+            
+    except ImportError as e:
+        io.tool_error("Redis integration not available. Please install required dependencies.")
+        io.tool_output("Run: pip install redis")
+        analytics.event("exit", reason="Redis not installed")
+        return 1
+    except Exception as e:
+        io.tool_error(f"Error initializing Redis integration: {e}")
+        analytics.event("exit", reason="Redis initialization error")
+        return 1
+
     if args.gui and not return_coder:
         if not check_streamlit_install(io):
             analytics.event("exit", reason="Streamlit not installed")
@@ -711,7 +877,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     # We can't know the git repo for sure until after parsing the args.
     # If we guessed wrong, reparse because that changes things like
     # the location of the config.yml and history files.
-    if args.git and not force_git_root and git is not None:
+    # Skip this check entirely if we're using Redis mode to prevent recursive calls
+    if args.git and not force_git_root and git is not None and not redis_repo_url:
         right_repo_root = guessed_wrong_repo(io, git_root, fnames, git_dname)
         if right_repo_root:
             analytics.event("exit", reason="Recursing with correct repo")
@@ -735,10 +902,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     if args.check_update:
         check_version(io, verbose=args.verbose)
 
-    if args.git:
-        git_root = setup_git(git_root, io)
-        if args.gitignore:
-            check_gitignore(git_root, io)
+    # Skip git setup since we're only using Redis repositories
+    # Local git functionality is disabled in this version
 
     if args.verbose:
         show = format_settings(parser, args)
@@ -897,13 +1062,23 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                 return 1
 
     repo = None
-    if args.git:
+    # Handle repository creation - Redis mode or git mode
+    repo = None
+    
+    if redis_repo_url:
+        # Redis mode - work with cached GitHub repository
         try:
-            repo = GitRepo(
+            # Handle cached repository reference
+            actual_repo_url = redis_repo_url
+            if redis_repo_url.startswith("cached:"):
+                # Extract the repository name from cached reference
+                actual_repo_url = redis_repo_url[7:]  # Remove "cached:" prefix
+            
+            repo = create_repo(
                 io,
                 fnames,
                 git_dname,
-                args.cosmosignore,
+                cosmos_ignore_file=args.cosmosignore,
                 models=main_model.commit_message_models(),
                 attribute_author=args.attribute_author,
                 attribute_committer=args.attribute_committer,
@@ -912,10 +1087,20 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                 commit_prompt=args.commit_prompt,
                 subtree_only=args.subtree_only,
                 git_commit_verify=args.git_commit_verify,
-                attribute_co_authored_by=args.attribute_co_authored_by,  # Pass the arg
+                attribute_co_authored_by=args.attribute_co_authored_by,
+                repo_url=actual_repo_url,  # Pass the actual repository URL/name
+                force_redis=True  # Force Redis mode
             )
-        except FileNotFoundError:
-            pass
+            io.tool_output("Working with Redis-cached repository")
+        except Exception as e:
+            io.tool_error(f"Failed to create Redis repository: {e}")
+            analytics.event("exit", reason="Redis repository creation failed")
+            return 1
+    else:
+        # This should not happen since we always set redis_repo_url above
+        io.tool_error("No repository configured. This should not happen.")
+        analytics.event("exit", reason="No repository configured")
+        return 1
 
     if not args.skip_sanity_check_repo:
         if not sanity_check_repo(repo, io):
@@ -965,11 +1150,14 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     # Track auto-commits configuration
     analytics.event("auto_commits", enabled=bool(args.auto_commits))
 
+    # Use repository's IO object if it has one (for Redis repositories)
+    coder_io = getattr(repo, 'io', io) if repo else io
+    
     try:
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
-            io=io,
+            io=coder_io,
             repo=repo,
             fnames=fnames,
             read_only_fnames=read_only_fnames,

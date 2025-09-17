@@ -44,6 +44,8 @@ from cosmos.reasoning_tags import (
     replace_reasoning_tags,
 )
 from cosmos.repo import ANY_GIT_ERROR, GitRepo
+from cosmos.repo_factory import create_repo
+from cosmos.virtual_io import create_virtual_io
 from cosmos.repomap import RepoMap
 from cosmos.run_cmd import run_cmd
 from cosmos.utils import format_content, format_messages, format_tokens, is_image_file
@@ -434,7 +436,7 @@ class Coder:
         self.repo = repo
         if use_git and self.repo is None:
             try:
-                self.repo = GitRepo(
+                self.repo = create_repo(
                     self.io,
                     fnames,
                     None,
@@ -442,6 +444,9 @@ class Coder:
                 )
             except FileNotFoundError:
                 pass
+
+        # Set up virtual IO wrapper for Redis repositories
+        self.io = create_virtual_io(self.io, self.repo)
 
         if self.repo:
             self.root = self.repo.root

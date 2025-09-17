@@ -30,6 +30,7 @@ pillow
 shtab
 oslex
 google-generativeai
+redis
 
 # The proper dependency is networkx[default], but this brings
 # in matplotlib and a bunch of other deps

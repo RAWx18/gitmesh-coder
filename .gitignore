@@ -18,5 +18,8 @@ cosmos/_version.py
 .gitattributes
 tmp.benchmarks/
 .docker_bash_history
-.env
+# .env
 venv/
+.env
+.kiro
+.pytest_cache
