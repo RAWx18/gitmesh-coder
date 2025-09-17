@@ -19,6 +19,7 @@ from cosmos.tier_access_control import (
     TierAccessDeniedError,
     get_tier_access_controller
 )
+from cosmos.repomap import RepoMap
 from cosmos import utils
 
 
@@ -38,7 +39,7 @@ class VirtualFileSystemIO:
         
         # Delegate all other attributes to the original IO
         for attr in dir(original_io):
-            if not attr.startswith('_') and attr not in ['read_text', 'read_image']:
+            if not attr.startswith('_') and attr not in ['read_text', 'read_image', 'get_mtime']:
                 setattr(self, attr, getattr(original_io, attr))
     
     def read_text(self, filename, silent=False):
@@ -53,7 +54,7 @@ class VirtualFileSystemIO:
             File content as string or None if not found
         """
         try:
-            # First try to read from the actual filesystem
+            # First try to read from the actual filesystem (for extracted files)
             result = self.original_io.read_text(filename, silent=True)
             if result is not None:
                 return result
@@ -84,9 +85,13 @@ class VirtualFileSystemIO:
                 if not silent:
                     logger.warning(f"Error reading from virtual filesystem {filename}: {e}")
         
-        # If all else fails, use original IO (which will show appropriate error)
+        # If all else fails, return None for RepoMap compatibility
+        if silent:
+            return None
+        
+        # For non-silent calls, try original IO one more time to get proper error handling
         try:
-            return self.original_io.read_text(filename, silent)
+            return self.original_io.read_text(filename, silent=False)
         except:
             return None
     
@@ -119,6 +124,108 @@ class VirtualFileSystemIO:
             File content as string or None if not found
         """
         return self.read_text(filename, silent=True)
+    
+    def get_mtime(self, filename):
+        """
+        Get file modification time for RepoMap caching.
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            Modification time or current time for virtual files
+        """
+        try:
+            # Try to get actual file mtime first (for extracted files)
+            return os.path.getmtime(filename)
+        except (FileNotFoundError, OSError):
+            # For virtual files, return a consistent timestamp based on repo data
+            # This ensures RepoMap caching works properly
+            file_path = Path(filename)
+            
+            # Check if it's a virtual file
+            if self.virtual_fs:
+                # Convert absolute path to relative if needed
+                if file_path.is_absolute():
+                    try:
+                        rel_path = file_path.relative_to(self.repo_root)
+                        if self.virtual_fs.file_exists(str(rel_path)):
+                            # Use a hash of the filename to create a consistent "mtime"
+                            return abs(hash(f"{self.repo_name}:{rel_path}")) % (2**31)
+                    except ValueError:
+                        pass
+                
+                # Try as-is
+                if self.virtual_fs.file_exists(str(filename)):
+                    return abs(hash(f"{self.repo_name}:{filename}")) % (2**31)
+            
+            return None
+    
+    def get_mtime(self, filename):
+        """
+        Get file modification time for RepoMap caching (VirtualFileSystemIO method).
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            Modification time or consistent hash for virtual files
+        """
+        try:
+            # Try to get actual file mtime first (for extracted files)
+            return os.path.getmtime(filename)
+        except (FileNotFoundError, OSError):
+            # For virtual files, return a consistent timestamp
+            file_path = Path(filename)
+            
+            if self.virtual_fs:
+                # Convert absolute path to relative if needed
+                if file_path.is_absolute():
+                    try:
+                        rel_path = file_path.relative_to(self.repo_root)
+                        if self.virtual_fs.file_exists(str(rel_path)):
+                            # Use a hash of the filename to create a consistent "mtime"
+                            return abs(hash(f"virtual:{rel_path}")) % (2**31)
+                    except ValueError:
+                        pass
+                
+                # Try as-is
+                if self.virtual_fs.file_exists(str(filename)):
+                    return abs(hash(f"virtual:{filename}")) % (2**31)
+            
+            return None
+    
+    def path_exists(self, filename):
+        """
+        Check if path exists for RepoMap compatibility.
+        
+        Args:
+            filename: Path to check
+            
+        Returns:
+            True if path exists in filesystem or virtual filesystem
+        """
+        try:
+            # Check actual filesystem first
+            if Path(filename).exists():
+                return True
+        except (OSError, ValueError):
+            pass
+        
+        # Check virtual filesystem
+        if self.virtual_fs:
+            # Convert absolute path to relative if needed
+            file_path = Path(filename)
+            if file_path.is_absolute():
+                try:
+                    rel_path = file_path.relative_to(self.repo_root)
+                    return self.virtual_fs.file_exists(str(rel_path))
+                except ValueError:
+                    pass
+            
+            return self.virtual_fs.file_exists(str(filename))
+        
+        return False
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +330,139 @@ class RedisRepoManager:
         # Set repo to self for GitRepo compatibility
         self.repo = self
         
+        # Initialize RepoMap for cloud-based implementation
+        self._init_repomap()
+        
+        # Ensure files are properly extracted for RepoMap
+        self._ensure_files_for_repomap()
+        
+        # Build RepoMap cache by triggering initial scan
+        self._build_repomap_cache()
+        
         logger.info(f"Initialized RedisRepoManager for {self.repo_name}")
+    
+    def _init_repomap(self) -> None:
+        """Initialize RepoMap for the cloud-based repository."""
+        try:
+            # Initialize RepoMap with the repository root and IO wrapper
+            main_model = None
+            if self.models:
+                # Try to get the main model from models object
+                if hasattr(self.models, 'main_model'):
+                    main_model = self.models.main_model
+                elif hasattr(self.models, 'model'):
+                    main_model = self.models.model
+            
+            self.repo_map = RepoMap(
+                map_tokens=1024,  # Default token limit for repo map
+                root=self.root,
+                main_model=main_model,
+                io=self.io,
+                verbose=False,
+                refresh="auto"
+            )
+            
+            # Override RepoMap's get_mtime method to work with virtual filesystem
+            original_get_mtime = self.repo_map.get_mtime
+            def custom_get_mtime(fname):
+                try:
+                    return self.io.get_mtime(fname)
+                except:
+                    return original_get_mtime(fname)
+            
+            self.repo_map.get_mtime = custom_get_mtime
+            logger.info(f"Initialized RepoMap for {self.repo_name}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize RepoMap for {self.repo_name}: {e}")
+            self.repo_map = None
+    
+    def _ensure_files_for_repomap(self) -> None:
+        """Ensure all files are properly extracted for RepoMap to access."""
+        if not self.virtual_fs:
+            return
+        
+        try:
+            tracked_files = self.get_tracked_files()
+            extracted_count = 0
+            
+            for file_path in tracked_files:
+                local_file_path = Path(self.root) / file_path
+                
+                # Only extract if file doesn't exist locally
+                if not local_file_path.exists():
+                    try:
+                        content = self.virtual_fs.extract_file_with_context(file_path)
+                        if content is not None:
+                            # Ensure directory exists
+                            local_file_path.parent.mkdir(parents=True, exist_ok=True)
+                            
+                            # Write file content
+                            with open(local_file_path, 'w', encoding='utf-8') as f:
+                                f.write(content)
+                            
+                            extracted_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to extract file {file_path} for RepoMap: {e}")
+                        continue
+            
+            if extracted_count > 0:
+                logger.info(f"Extracted {extracted_count} additional files for RepoMap")
+                
+        except Exception as e:
+            logger.error(f"Error ensuring files for RepoMap: {e}")
+    
+    def _build_repomap_cache(self) -> None:
+        """Build RepoMap cache by triggering initial file scan."""
+        if not self.repo_map:
+            return
+        
+        try:
+            tracked_files = self.get_tracked_files()
+            if not tracked_files:
+                logger.info("No tracked files found, skipping RepoMap cache build")
+                return
+            
+            # Convert to absolute paths for RepoMap
+            abs_files = []
+            for file_path in tracked_files:
+                abs_path = str(Path(self.root) / file_path)
+                if Path(abs_path).exists():
+                    abs_files.append(abs_path)
+            
+            if not abs_files:
+                logger.info("No physical files found for RepoMap cache build")
+                return
+            
+            logger.info(f"Building RepoMap cache for {len(abs_files)} files...")
+            
+            # Trigger RepoMap to scan files and build cache by calling get_ranked_tags
+            # This will force RepoMap to process files and create .cosmos.tags.cache
+            try:
+                self.repo_map.get_ranked_tags(
+                    chat_fnames=[],  # No chat files for initial scan
+                    other_fnames=abs_files[:50],  # Limit to first 50 files to avoid timeout
+                    mentioned_fnames=set(),
+                    mentioned_idents=set()
+                )
+                logger.info(f"Successfully built RepoMap cache for {self.repo_name}")
+            except Exception as e:
+                logger.warning(f"Error during RepoMap cache build: {e}")
+                # Try a smaller subset if the full scan fails
+                if len(abs_files) > 10:
+                    logger.info("Retrying with smaller file set...")
+                    self.repo_map.get_ranked_tags(
+                        chat_fnames=[],
+                        other_fnames=abs_files[:10],
+                        mentioned_fnames=set(),
+                        mentioned_idents=set()
+                    )
+                    logger.info(f"Built RepoMap cache with reduced file set for {self.repo_name}")
+                else:
+                    raise
+            
+        except Exception as e:
+            logger.warning(f"Failed to build RepoMap cache for {self.repo_name}: {e}")
+            # Don't fail initialization if cache building fails
     
     def _extract_repo_name(self, repo_url: str) -> str:
         """Extract repository name from URL."""
@@ -1356,3 +1595,343 @@ class RedisRepoManager:
     def iter_commits(self, *args, **kwargs):
         """Simulate git commit iteration."""
         return iter([])  # No commits in Redis backend
+    
+    # RepoMap integration methods
+    
+    def get_repo_map(self, chat_files=None, other_files=None, mentioned_fnames=None, 
+                     mentioned_idents=None, force_refresh=False):
+        """
+        Get repository map using RepoMap for cloud-based implementation.
+        
+        Args:
+            chat_files: List of files currently in chat context
+            other_files: List of other files to consider for the map
+            mentioned_fnames: Set of mentioned filenames
+            mentioned_idents: Set of mentioned identifiers
+            force_refresh: Whether to force refresh the map
+            
+        Returns:
+            Repository map as string or None if not available
+        """
+        if not self.repo_map:
+            return None
+        
+        try:
+            # Ensure we have file lists
+            if chat_files is None:
+                chat_files = []
+            if other_files is None:
+                other_files = self.get_tracked_files()
+            
+            # Convert relative paths to absolute paths for RepoMap
+            # Ensure files exist in the extracted directory structure
+            abs_chat_files = []
+            abs_other_files = []
+            
+            for f in chat_files:
+                if f:
+                    abs_path = str(Path(self.root) / f)
+                    if Path(abs_path).exists() or self.file_exists(f):
+                        abs_chat_files.append(abs_path)
+            
+            for f in other_files:
+                if f:
+                    abs_path = str(Path(self.root) / f)
+                    if Path(abs_path).exists() or self.file_exists(f):
+                        abs_other_files.append(abs_path)
+            
+            # Get the repository map
+            repo_map = self.repo_map.get_repo_map(
+                chat_files=abs_chat_files,
+                other_files=abs_other_files,
+                mentioned_fnames=mentioned_fnames,
+                mentioned_idents=mentioned_idents,
+                force_refresh=force_refresh
+            )
+            
+            return repo_map
+            
+        except Exception as e:
+            logger.warning(f"Error generating repo map for {self.repo_name}: {e}")
+            return None
+    
+    def get_ranked_tags_map(self, chat_files=None, other_files=None, max_map_tokens=None,
+                           mentioned_fnames=None, mentioned_idents=None, force_refresh=False):
+        """
+        Get ranked tags map using RepoMap.
+        
+        Args:
+            chat_files: List of files currently in chat context
+            other_files: List of other files to consider
+            max_map_tokens: Maximum tokens for the map
+            mentioned_fnames: Set of mentioned filenames
+            mentioned_idents: Set of mentioned identifiers
+            force_refresh: Whether to force refresh
+            
+        Returns:
+            Ranked tags map as string or None if not available
+        """
+        if not self.repo_map:
+            return None
+        
+        try:
+            # Ensure we have file lists
+            if chat_files is None:
+                chat_files = []
+            if other_files is None:
+                other_files = self.get_tracked_files()
+            
+            # Convert relative paths to absolute paths for RepoMap
+            # Ensure files exist in the extracted directory structure
+            abs_chat_files = []
+            abs_other_files = []
+            
+            for f in chat_files:
+                if f:
+                    abs_path = str(Path(self.root) / f)
+                    if Path(abs_path).exists() or self.file_exists(f):
+                        abs_chat_files.append(abs_path)
+            
+            for f in other_files:
+                if f:
+                    abs_path = str(Path(self.root) / f)
+                    if Path(abs_path).exists() or self.file_exists(f):
+                        abs_other_files.append(abs_path)
+            
+            # Get the ranked tags map
+            ranked_map = self.repo_map.get_ranked_tags_map(
+                chat_fnames=abs_chat_files,
+                other_fnames=abs_other_files,
+                max_map_tokens=max_map_tokens,
+                mentioned_fnames=mentioned_fnames,
+                mentioned_idents=mentioned_idents,
+                force_refresh=force_refresh
+            )
+            
+            return ranked_map
+            
+        except Exception as e:
+            logger.warning(f"Error generating ranked tags map for {self.repo_name}: {e}")
+            return None
+    
+    def refresh_repo_map(self):
+        """Refresh the repository map cache."""
+        if self.repo_map:
+            try:
+                # Clear the map cache to force refresh
+                self.repo_map.map_cache.clear()
+                self.repo_map.tree_cache.clear()
+                self.repo_map.tree_context_cache.clear()
+                
+                # Clear the tags cache to force rebuild
+                if hasattr(self.repo_map, 'TAGS_CACHE'):
+                    if hasattr(self.repo_map.TAGS_CACHE, 'clear'):
+                        self.repo_map.TAGS_CACHE.clear()
+                
+                # Re-extract files to ensure RepoMap has latest content
+                self._ensure_files_for_repomap()
+                
+                # Rebuild the cache
+                self._build_repomap_cache()
+                
+                logger.info(f"Refreshed repo map cache for {self.repo_name}")
+            except Exception as e:
+                logger.warning(f"Error refreshing repo map for {self.repo_name}: {e}")
+    
+    def get_repomap_cache_path(self):
+        """Get the path to the RepoMap cache directory."""
+        if self.repo_map:
+            return Path(self.root) / self.repo_map.TAGS_CACHE_DIR
+        return None
+    
+    def repomap_cache_exists(self):
+        """Check if RepoMap cache directory exists."""
+        cache_path = self.get_repomap_cache_path()
+        return cache_path and cache_path.exists()
+    
+    def force_rebuild_repomap_cache(self):
+        """Force rebuild of RepoMap cache."""
+        if not self.repo_map:
+            return False
+        
+        try:
+            # Remove existing cache directory
+            cache_path = self.get_repomap_cache_path()
+            if cache_path and cache_path.exists():
+                import shutil
+                shutil.rmtree(cache_path)
+                logger.info(f"Removed existing RepoMap cache at {cache_path}")
+            
+            # Reload the cache
+            self.repo_map.load_tags_cache()
+            
+            # Rebuild cache
+            self._build_repomap_cache()
+            
+            logger.info(f"Force rebuilt RepoMap cache for {self.repo_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error force rebuilding RepoMap cache: {e}")
+            return False
+    
+    def set_repo_map_tokens(self, max_tokens):
+        """Set the maximum tokens for repository map."""
+        if self.repo_map:
+            self.repo_map.max_map_tokens = max_tokens
+            # Clear cache to ensure new token limit is applied
+            self.repo_map.map_cache.clear()
+            logger.info(f"Set repo map tokens to {max_tokens} for {self.repo_name}")
+    
+    def configure_repo_map(self, **kwargs):
+        """Configure RepoMap settings."""
+        if not self.repo_map:
+            return False
+        
+        try:
+            updated = False
+            
+            if 'max_tokens' in kwargs:
+                self.repo_map.max_map_tokens = kwargs['max_tokens']
+                updated = True
+            
+            if 'refresh_mode' in kwargs:
+                self.repo_map.refresh = kwargs['refresh_mode']
+                updated = True
+            
+            if 'verbose' in kwargs:
+                self.repo_map.verbose = kwargs['verbose']
+                updated = True
+            
+            if 'map_mul_no_files' in kwargs:
+                self.repo_map.map_mul_no_files = kwargs['map_mul_no_files']
+                updated = True
+            
+            if updated:
+                # Clear cache when configuration changes
+                self.repo_map.map_cache.clear()
+                logger.info(f"Updated RepoMap configuration for {self.repo_name}")
+            
+            return updated
+        except Exception as e:
+            logger.warning(f"Error configuring RepoMap for {self.repo_name}: {e}")
+            return False
+    
+    def get_repo_map_stats(self):
+        """Get repository map statistics."""
+        if not self.repo_map:
+            return None
+        
+        try:
+            stats = {
+                'max_map_tokens': self.repo_map.max_map_tokens,
+                'cache_size': len(getattr(self.repo_map, 'map_cache', {})),
+                'tree_cache_size': len(getattr(self.repo_map, 'tree_cache', {})),
+                'processing_time': getattr(self.repo_map, 'map_processing_time', 0),
+                'root': self.repo_map.root,
+                'refresh_mode': self.repo_map.refresh,
+                'repo_name': self.repo_name,
+                'tracked_files_count': len(self.get_tracked_files()),
+                'extracted_files_exist': any(Path(self.root).glob('*'))
+            }
+            return stats
+        except Exception as e:
+            logger.warning(f"Error getting repo map stats for {self.repo_name}: {e}")
+            return None
+    
+    def is_repomap_available(self):
+        """Check if RepoMap is available and properly initialized."""
+        return self.repo_map is not None
+    
+    def get_repomap_supported_files(self):
+        """Get list of files that RepoMap can process (have language support)."""
+        if not self.repo_map:
+            return []
+        
+        try:
+            from grep_ast import filename_to_lang
+            
+            tracked_files = self.get_tracked_files()
+            supported_files = []
+            
+            for file_path in tracked_files:
+                abs_path = str(Path(self.root) / file_path)
+                if filename_to_lang(abs_path):
+                    supported_files.append(file_path)
+            
+            return supported_files
+        except Exception as e:
+            logger.warning(f"Error getting RepoMap supported files: {e}")
+            return []
+    
+    def verify_repomap_integration(self):
+        """
+        Verify that RepoMap integration is working correctly.
+        
+        Returns:
+            Dict with verification results
+        """
+        results = {
+            'repomap_available': False,
+            'cache_exists': False,
+            'files_extracted': False,
+            'tags_extracted': False,
+            'map_generated': False,
+            'errors': []
+        }
+        
+        try:
+            # Check if RepoMap is available
+            results['repomap_available'] = self.is_repomap_available()
+            
+            if not results['repomap_available']:
+                results['errors'].append("RepoMap not initialized")
+                return results
+            
+            # Check if cache exists
+            results['cache_exists'] = self.repomap_cache_exists()
+            
+            # Check if files are extracted
+            tracked_files = self.get_tracked_files()
+            if tracked_files:
+                extracted_count = 0
+                for file_path in tracked_files:
+                    local_path = Path(self.root) / file_path
+                    if local_path.exists():
+                        extracted_count += 1
+                
+                results['files_extracted'] = extracted_count > 0
+                results['extracted_count'] = extracted_count
+                results['total_files'] = len(tracked_files)
+            
+            # Test tag extraction
+            if tracked_files and results['files_extracted']:
+                try:
+                    # Test with first Python file
+                    python_files = [f for f in tracked_files if f.endswith('.py')]
+                    if python_files:
+                        test_file = python_files[0]
+                        abs_path = str(Path(self.root) / test_file)
+                        rel_path = self.repo_map.get_rel_fname(abs_path)
+                        tags = self.repo_map.get_tags(abs_path, rel_path)
+                        results['tags_extracted'] = len(tags) > 0
+                        results['sample_tags_count'] = len(tags)
+                except Exception as e:
+                    results['errors'].append(f"Tag extraction failed: {e}")
+            
+            # Test map generation
+            if tracked_files:
+                try:
+                    repo_map = self.get_repo_map(
+                        chat_files=[],
+                        other_files=tracked_files[:5]  # Test with first 5 files
+                    )
+                    results['map_generated'] = repo_map is not None and len(repo_map) > 0
+                    if results['map_generated']:
+                        results['map_length'] = len(repo_map)
+                except Exception as e:
+                    results['errors'].append(f"Map generation failed: {e}")
+            
+        except Exception as e:
+            results['errors'].append(f"Verification failed: {e}")
+        
+        return results
