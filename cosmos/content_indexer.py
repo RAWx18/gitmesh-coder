@@ -196,15 +196,60 @@ class ContentIndexer:
                 # Join and clean up content
                 content = ''.join(content_lines)
                 
-                # Remove trailing boundary markers if present
-                if content.endswith('=' * 48 + '\n'):
-                    content = content[:-49]
+                # Remove boundary markers and cleanup
+                content = self._clean_file_content(content)
                 
-                return content.rstrip() + '\n' if content.strip() else ''
+                return content
                 
         except Exception as e:
             logger.error(f"Failed to get content for {file_path} in {self.repo_name}: {e}")
             return None
+    
+    def _clean_file_content(self, content: str) -> str:
+        """
+        Clean file content by removing boundary markers and normalizing format.
+        
+        Args:
+            content: Raw file content that may contain boundary markers
+            
+        Returns:
+            Cleaned file content
+        """
+        if not content:
+            return ''
+        
+        lines = content.splitlines(keepends=True)
+        cleaned_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            # Skip boundary marker lines (48 equals signs)
+            if stripped == '=' * 48:
+                continue
+            # Skip FILE: header lines
+            if stripped.startswith('FILE: '):
+                continue
+            cleaned_lines.append(line)
+        
+        # Join back and ensure proper line ending
+        cleaned_content = ''.join(cleaned_lines)
+        
+        # Remove any leading/trailing boundary markers that might have been missed
+        while cleaned_content.startswith('=' * 48):
+            lines = cleaned_content.splitlines(keepends=True)
+            if lines:
+                cleaned_content = ''.join(lines[1:])
+            else:
+                break
+                
+        while cleaned_content.endswith('=' * 48 + '\n'):
+            cleaned_content = cleaned_content[:-49]
+        
+        # Ensure file ends with newline if it has content
+        if cleaned_content and not cleaned_content.endswith('\n'):
+            cleaned_content += '\n'
+            
+        return cleaned_content
     
     def file_exists(self, file_path: str) -> bool:
         """

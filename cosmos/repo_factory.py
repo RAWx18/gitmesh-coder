@@ -28,7 +28,12 @@ def create_repo(
     git_commit_verify: bool = True,
     attribute_co_authored_by: bool = False,
     repo_url: Optional[str] = None,
-    force_redis: bool = False
+    force_redis: bool = False,
+    create_pull_request: bool = False,  # New parameter for PR mode
+    pr_base_branch: str = 'main',  # Base branch for PRs
+    pr_draft: bool = False,  # Whether to create draft PRs
+    auto_cleanup: bool = True,  # Whether to automatically cleanup temporary files
+    github_token: Optional[str] = None,  # GitHub token for PR operations
 ):
     """
     Create appropriate repository instance based on configuration.
@@ -52,6 +57,11 @@ def create_repo(
         attribute_co_authored_by: Whether to attribute co-authored by
         repo_url: Repository URL (required for Redis mode)
         force_redis: Force Redis mode even without repo_url
+        create_pull_request: Whether to create pull requests instead of direct commits
+        pr_base_branch: Base branch for pull requests
+        pr_draft: Whether to create draft pull requests
+        auto_cleanup: Whether to automatically cleanup temporary files after operations
+        github_token: GitHub personal access token for PR operations
         
     Returns:
         GitRepo or RedisRepoManager instance
@@ -92,7 +102,12 @@ def create_repo(
                 commit_prompt=commit_prompt,
                 subtree_only=subtree_only,
                 git_commit_verify=git_commit_verify,
-                attribute_co_authored_by=attribute_co_authored_by
+                attribute_co_authored_by=attribute_co_authored_by,
+                create_pull_request=create_pull_request,
+                pr_base_branch=pr_base_branch,
+                pr_draft=pr_draft,
+                auto_cleanup=auto_cleanup,
+                github_token=github_token
             )
     
     # Default to GitRepo for local repositories
@@ -109,7 +124,10 @@ def create_repo(
         commit_prompt=commit_prompt,
         subtree_only=subtree_only,
         git_commit_verify=git_commit_verify,
-        attribute_co_authored_by=attribute_co_authored_by
+        attribute_co_authored_by=attribute_co_authored_by,
+        create_pull_request=create_pull_request,
+        pr_base_branch=pr_base_branch,
+        pr_draft=pr_draft
     )
 
 

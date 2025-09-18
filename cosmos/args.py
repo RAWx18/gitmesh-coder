@@ -564,6 +564,39 @@ def get_parser(default_config_files, git_root):
     )
 
     ##########
+    group = parser.add_argument_group("GitHub Pull Requests")
+    group.add_argument(
+        "--create-pull-request",
+        "--pr",
+        action="store_true",
+        help="Create a GitHub pull request instead of committing directly to the current branch",
+        default=False,
+    )
+    group.add_argument(
+        "--pr-base-branch",
+        metavar="BRANCH",
+        default="main",
+        help="Base branch for pull requests (default: main)",
+    )
+    group.add_argument(
+        "--pr-draft",
+        action="store_true",
+        help="Create pull requests as drafts (default: False)",
+        default=False,
+    )
+    group.add_argument(
+        "--github-token",
+        metavar="TOKEN",
+        help="GitHub personal access token (can also be set via GITHUB_TOKEN env var)",
+    )
+    group.add_argument(
+        "--no-auto-cleanup",
+        action="store_true",
+        help="Disable automatic cleanup of temporary files after operations (default: enabled)",
+        default=False,
+    )
+
+    ##########
     group = parser.add_argument_group("Analytics")
     group.add_argument(
         "--analytics",

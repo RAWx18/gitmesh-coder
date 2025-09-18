@@ -2383,14 +2383,30 @@ class Coder:
             context = self.get_context_from_history(self.cur_messages)
 
         try:
-            res = self.repo.commit(fnames=edited, context=context, cosmos_edits=True, coder=self)
-            if res:
-                self.show_auto_commit_outcome(res)
-                commit_hash, commit_message = res
-                return self.gpt_prompts.files_content_gpt_edits.format(
-                    hash=commit_hash,
-                    message=commit_message,
-                )
+            # Use commit_and_create_pr if PR mode is enabled and the method exists
+            if (hasattr(self.repo, 'create_pull_request') and 
+                self.repo.create_pull_request and
+                hasattr(self.repo, 'commit_and_create_pr')):
+                res = self.repo.commit_and_create_pr(fnames=edited, context=context, cosmos_edits=True, coder=self)
+                if res:
+                    # Extract commit info from the result
+                    commit_hash = res.get('commit_hash')
+                    commit_message = res.get('commit_message')
+                    if commit_hash and commit_message:
+                        self.show_auto_commit_outcome((commit_hash, commit_message))
+                        return self.gpt_prompts.files_content_gpt_edits.format(
+                            hash=commit_hash,
+                            message=commit_message,
+                        )
+            else:
+                res = self.repo.commit(fnames=edited, context=context, cosmos_edits=True, coder=self)
+                if res:
+                    self.show_auto_commit_outcome(res)
+                    commit_hash, commit_message = res
+                    return self.gpt_prompts.files_content_gpt_edits.format(
+                        hash=commit_hash,
+                        message=commit_message,
+                    )
 
             return self.gpt_prompts.files_content_gpt_no_edits
         except ANY_GIT_ERROR as err:
@@ -2419,7 +2435,13 @@ class Coder:
         if not self.repo:
             return
 
-        self.repo.commit(fnames=self.need_commit_before_edits, coder=self)
+        # Use commit_and_create_pr if PR mode is enabled and the method exists
+        if (hasattr(self.repo, 'create_pull_request') and 
+            self.repo.create_pull_request and
+            hasattr(self.repo, 'commit_and_create_pr')):
+            self.repo.commit_and_create_pr(fnames=self.need_commit_before_edits, coder=self)
+        else:
+            self.repo.commit(fnames=self.need_commit_before_edits, coder=self)
 
         # files changed, move cur messages back behind the files messages
         # self.move_back_cur_messages(self.gpt_prompts.files_content_local_edits)
