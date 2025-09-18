@@ -398,8 +398,18 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
         elif '/' in repo_name:
             # Format like "owner/repo"
             owner, repo_name_clean = repo_name.split('/', 1)
+        elif '_' in repo_name:
+            # Handle format like "owner_repo" (convert to "owner/repo")
+            owner, repo_name_clean = repo_name.split('_', 1)
+            if io:
+                io.tool_output(f"Converted repository name from {repo_name} to {owner}/{repo_name_clean}")
         else:
             raise GitHubPRError(f"Cannot determine repository owner and name from: {repo_url or repo_name}")
+        
+        # Debug logging
+        if io:
+            io.tool_output(f"Extracted repository: {owner}/{repo_name_clean}")
+            io.tool_output(f"From repo_url: {repo_url}, repo_name: {repo_name}")
         
         # Get GitHub token
         token = github_token or getattr(repo, 'github_token', None) or os.getenv('GITHUB_TOKEN')
@@ -411,6 +421,19 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
             'Accept': 'application/vnd.github.v3+json',
             'Content-Type': 'application/json'
         }
+        
+        # Verify token permissions
+        user_url = "https://api.github.com/user"
+        user_response = requests.get(user_url, headers=headers)
+        
+        if user_response.status_code == 401:
+            raise GitHubPRError("Invalid GitHub token. Please check your GITHUB_TOKEN environment variable.")
+        elif user_response.status_code != 200:
+            raise GitHubPRError(f"Failed to verify GitHub token: {user_response.status_code}")
+        
+        user_info = user_response.json()
+        if io:
+            io.tool_output(f"GitHub token verified for user: {user_info.get('login', 'unknown')}")
         
         # Generate branch name and PR details
         timestamp = int(time.time())
@@ -430,17 +453,78 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
             io.tool_output(f"Branch: {branch_name}")
             io.tool_output(f"Title: {pr_title}")
         
-        # Step 1: Get the reference to the base branch
-        ref_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/git/refs/heads/{base_branch}"
+        # Step 1: Verify repository access
+        repo_check_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}"
+        repo_check_response = requests.get(repo_check_url, headers=headers)
+        
+        if repo_check_response.status_code == 404:
+            raise GitHubPRError(f"Repository {owner}/{repo_name_clean} not found or not accessible with provided token")
+        elif repo_check_response.status_code != 200:
+            raise GitHubPRError(f"Failed to access repository: {repo_check_response.status_code} - {repo_check_response.text}")
+        
+        repo_info = repo_check_response.json()
+        if io:
+            io.tool_output(f"Repository access confirmed: {repo_info.get('full_name')}")
+            io.tool_output(f"Default branch: {repo_info.get('default_branch', 'unknown')}")
+        
+        # Get current user info to check ownership
+        user_response = requests.get("https://api.github.com/user", headers=headers)
+        if user_response.status_code != 200:
+            raise GitHubPRError("Failed to get user information")
+        
+        current_user = user_response.json()['login']
+        
+        # Check if this is the user's own repository
+        is_own_repo = (owner.lower() == current_user.lower())
+        
+        if not is_own_repo:
+            raise GitHubPRError(f"❌ Pull requests are only allowed for your own repositories.\n"
+                              f"Repository {owner}/{repo_name_clean} belongs to {owner}, but you are {current_user}.\n"
+                              f"Please work with your own repositories or use the buffer to stage changes locally.")
+        
+        # Check if user has write access to their own repo
+        permissions = repo_info.get('permissions', {})
+        has_write_access = permissions.get('push', False)
+        
+        if not has_write_access:
+            raise GitHubPRError(f"❌ No write access to your repository {owner}/{repo_name_clean}.\n"
+                              f"Please check your repository permissions.")
+        
+        if io:
+            io.tool_output(f"✅ Confirmed ownership and write access to {owner}/{repo_name_clean}")
+        
+        # Use the original repository (no forking needed for own repos)
+        fork_owner = owner
+        fork_repo = repo_name_clean
+        
+        # Use the repository's default branch if base_branch is 'main' but doesn't exist
+        actual_base_branch = base_branch
+        if base_branch == 'main' and repo_info.get('default_branch') != 'main':
+            actual_base_branch = repo_info.get('default_branch', 'main')
+            if io:
+                io.tool_output(f"Using repository default branch: {actual_base_branch}")
+        
+        # Step 2: Get the reference to the base branch (from original repo)
+        ref_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/git/refs/heads/{actual_base_branch}"
         ref_response = requests.get(ref_url, headers=headers)
         
         if ref_response.status_code != 200:
-            raise GitHubPRError(f"Failed to get base branch reference: {ref_response.status_code} - {ref_response.text}")
+            # Try to list available branches
+            branches_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/branches"
+            branches_response = requests.get(branches_url, headers=headers)
+            available_branches = []
+            if branches_response.status_code == 200:
+                available_branches = [b['name'] for b in branches_response.json()]
+            
+            error_msg = f"Failed to get base branch '{actual_base_branch}' reference: {ref_response.status_code}"
+            if available_branches:
+                error_msg += f"\nAvailable branches: {', '.join(available_branches[:5])}"
+            raise GitHubPRError(error_msg)
         
         base_sha = ref_response.json()['object']['sha']
         
-        # Step 2: Create a new branch reference
-        create_ref_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/git/refs"
+        # Step 3: Create a new branch reference (in fork if we're using one)
+        create_ref_url = f"https://api.github.com/repos/{fork_owner}/{fork_repo}/git/refs"
         create_ref_data = {
             "ref": f"refs/heads/{branch_name}",
             "sha": base_sha
@@ -449,7 +533,17 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
         ref_create_response = requests.post(create_ref_url, headers=headers, json=create_ref_data)
         
         if ref_create_response.status_code != 201:
-            raise GitHubPRError(f"Failed to create branch: {ref_create_response.status_code} - {ref_create_response.text}")
+            error_detail = ref_create_response.text
+            try:
+                error_json = ref_create_response.json()
+                if 'message' in error_json:
+                    error_detail = error_json['message']
+            except:
+                pass
+            raise GitHubPRError(f"Failed to create branch in {fork_owner}/{fork_repo}: {ref_create_response.status_code} - {error_detail}")
+        
+        if io:
+            io.tool_output(f"✅ Created branch: {branch_name} in {fork_owner}/{fork_repo}")
         
         if io:
             io.tool_output(f"✅ Created branch: {branch_name}")
@@ -457,35 +551,52 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
         # Step 3: Get current file contents and create commits for changed files
         commits_created = []
         
-        for file_path in changed_files:
+        # Limit the number of files to avoid API rate limits
+        max_files = 10
+        files_to_process = changed_files[:max_files]
+        
+        if len(changed_files) > max_files:
+            if io:
+                io.tool_warning(f"Limiting to first {max_files} files to avoid API limits")
+        
+        for file_path in files_to_process:
             try:
                 # Get the file content using the repo's method
+                file_content = None
+                
                 if hasattr(repo, 'get_file_content_for_pr'):
                     file_content = repo.get_file_content_for_pr(file_path)
                 elif hasattr(repo, 'virtual_fs') and repo.virtual_fs:
                     file_content = repo.virtual_fs.extract_file_with_context(file_path)
                 elif hasattr(repo, 'content_indexer') and repo.content_indexer:
                     file_content = repo.content_indexer.get_file_content(file_path)
-                else:
-                    if io:
-                        io.tool_warning(f"Could not get content for {file_path}")
-                    continue
                 
                 if not file_content:
                     if io:
-                        io.tool_warning(f"Empty content for {file_path}")
+                        io.tool_warning(f"Could not get content for {file_path}, skipping")
+                    continue
+                
+                # Validate content is not too large (GitHub has a 100MB limit)
+                if len(file_content.encode('utf-8')) > 50 * 1024 * 1024:  # 50MB limit for safety
+                    if io:
+                        io.tool_warning(f"File {file_path} too large, skipping")
                     continue
                 
                 # Encode content to base64
-                content_encoded = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
+                try:
+                    content_encoded = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
+                except UnicodeEncodeError:
+                    if io:
+                        io.tool_warning(f"Could not encode {file_path}, skipping")
+                    continue
                 
-                # Check if file exists in the repository
-                file_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/contents/{file_path}"
-                file_response = requests.get(file_url, headers=headers, params={'ref': base_branch})
+                # Check if file exists in the fork (use actual_base_branch)
+                file_url = f"https://api.github.com/repos/{fork_owner}/{fork_repo}/contents/{file_path}"
+                file_response = requests.get(file_url, headers=headers, params={'ref': actual_base_branch})
                 
                 # Create or update the file
                 update_data = {
-                    "message": f"Update {file_path}",
+                    "message": f"Update {file_path} via cosmos",
                     "content": content_encoded,
                     "branch": branch_name
                 }
@@ -494,8 +605,15 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
                     # File exists, update it
                     existing_file = file_response.json()
                     update_data["sha"] = existing_file["sha"]
-                # If file doesn't exist (404), we'll create it (no SHA needed)
+                elif file_response.status_code == 404:
+                    # File doesn't exist, create it (no SHA needed)
+                    pass
+                else:
+                    if io:
+                        io.tool_warning(f"Could not check {file_path} status: {file_response.status_code}")
+                    continue
                 
+                # Make the update/create request (to the fork)
                 update_response = requests.put(file_url, headers=headers, json=update_data)
                 
                 if update_response.status_code in [200, 201]:
@@ -503,8 +621,16 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
                     if io:
                         io.tool_output(f"✅ Updated {file_path}")
                 else:
+                    error_detail = update_response.text
+                    try:
+                        error_json = update_response.json()
+                        if 'message' in error_json:
+                            error_detail = error_json['message']
+                    except:
+                        pass
+                    
                     if io:
-                        io.tool_warning(f"Failed to update {file_path}: {update_response.status_code}")
+                        io.tool_warning(f"Failed to update {file_path}: {update_response.status_code} - {error_detail}")
                     
             except Exception as e:
                 if io:
@@ -513,16 +639,20 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
         
         if not commits_created:
             # Clean up the branch if no commits were made
-            delete_ref_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/git/refs/heads/{branch_name}"
+            delete_ref_url = f"https://api.github.com/repos/{fork_owner}/{fork_repo}/git/refs/heads/{branch_name}"
             requests.delete(delete_ref_url, headers=headers)
             raise GitHubPRError("No files could be updated in the repository")
         
-        # Step 4: Create the pull request
+        # Step 4: Create the pull request (from fork to original repo)
         pr_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/pulls"
+        
+        # If we're using a fork, the head should be "fork_owner:branch_name"
+        head_ref = branch_name if fork_owner == owner else f"{fork_owner}:{branch_name}"
+        
         pr_data = {
             "title": pr_title,
             "body": pr_body,
-            "head": branch_name,
+            "head": head_ref,
             "base": base_branch,
             "draft": draft
         }
@@ -548,7 +678,7 @@ def create_redis_pull_request(repo, commit_message: str, changed_files: List[str
             }
         else:
             # Clean up the branch if PR creation failed
-            delete_ref_url = f"https://api.github.com/repos/{owner}/{repo_name_clean}/git/refs/heads/{branch_name}"
+            delete_ref_url = f"https://api.github.com/repos/{fork_owner}/{fork_repo}/git/refs/heads/{branch_name}"
             requests.delete(delete_ref_url, headers=headers)
             
             error_msg = f"Failed to create pull request: {pr_response.status_code} - {pr_response.text}"

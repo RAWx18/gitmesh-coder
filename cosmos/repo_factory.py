@@ -88,6 +88,9 @@ def create_repo(
             raise ValueError("Redis mode requested but no repo_url provided")
             
         if repo_url or force_redis:
+            # Enable PR mode by default for Redis repositories since direct commits aren't supported
+            redis_create_pr = create_pull_request or True  # Default to True for Redis mode
+            
             return RedisRepoManager(
                 io=io,
                 fnames=fnames,
@@ -103,7 +106,7 @@ def create_repo(
                 subtree_only=subtree_only,
                 git_commit_verify=git_commit_verify,
                 attribute_co_authored_by=attribute_co_authored_by,
-                create_pull_request=create_pull_request,
+                create_pull_request=redis_create_pr,  # Use the default-enabled value
                 pr_base_branch=pr_base_branch,
                 pr_draft=pr_draft,
                 auto_cleanup=auto_cleanup,

@@ -311,8 +311,12 @@ class Commands:
 
     def run(self, inp):
         if inp.startswith("!"):
-            self.coder.event("command_run")
-            return self.do_run("run", inp[1:])
+            # PERMANENTLY DISABLED: Shell command execution not supported in Redis Cloud mode
+            self.io.tool_error("❌ Shell command execution (!) is permanently disabled in Redis Cloud mode.")
+            self.io.tool_output("💡 Use the buffer system and PR workflow instead.")
+            return None
+            # Original: self.coder.event("command_run")
+            # Original: return self.do_run("run", inp[1:])
 
         res = self.matching_commands(inp)
         if res is None:
@@ -373,11 +377,45 @@ class Commands:
         
         if args == "on" or args == "enable":
             if hasattr(self.coder.repo, 'create_pull_request'):
+                # Check if this is the user's own repository
+                repo_name = getattr(self.coder.repo, 'repo_name', '')
+                if repo_name and '/' in repo_name:
+                    self.io.tool_output("🔍 Checking repository ownership...")
+                    
+                    # Quick ownership check
+                    import os
+                    github_token = os.getenv('GITHUB_TOKEN')
+                    if github_token:
+                        try:
+                            import requests
+                            headers = {
+                                'Authorization': f'token {github_token}',
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                            
+                            user_response = requests.get("https://api.github.com/user", headers=headers)
+                            if user_response.status_code == 200:
+                                current_user = user_response.json()['login']
+                                owner = repo_name.split('/')[0]
+                                
+                                if owner.lower() != current_user.lower():
+                                    self.io.tool_error(f"❌ Cannot enable PR mode: Repository {repo_name} belongs to {owner}, but you are {current_user}")
+                                    self.io.tool_output("💡 PR mode can only be enabled for your own repositories")
+                                    self.io.tool_output("📋 You can still use the buffer to stage changes locally")
+                                    self.io.tool_output("🔄 Use /buffer to view changes, then copy them to your own repository")
+                                    return
+                                else:
+                                    self.io.tool_output(f"✅ Ownership confirmed: You own {repo_name}")
+                        except Exception as e:
+                            self.io.tool_warning(f"Could not verify ownership: {e}")
+                            self.io.tool_output("⚠️  Proceeding with caution - ownership will be checked during PR creation")
+                
                 self.coder.repo.create_pull_request = True
                 self.io.tool_output("✅ Pull request mode enabled")
-                self.io.tool_output(f"Base branch: {getattr(self.coder.repo, 'pr_base_branch', 'main')}")
-                self.io.tool_output(f"Draft PRs: {'Yes' if getattr(self.coder.repo, 'pr_draft', False) else 'No'}")
-                self.io.tool_output("Future commits will create pull requests instead of committing directly")
+                self.io.tool_output(f"📂 Repository: {repo_name}")
+                self.io.tool_output(f"🌿 Base branch: {getattr(self.coder.repo, 'pr_base_branch', 'main')}")
+                self.io.tool_output(f"📝 Draft PRs: {'Yes' if getattr(self.coder.repo, 'pr_draft', False) else 'No'}")
+                self.io.tool_output("🚀 Future commits will create pull requests")
             else:
                 self.io.tool_error("Pull request mode not supported in this repository type")
                 
@@ -424,6 +462,221 @@ class Commands:
                 self.io.tool_output("  /pr draft       - Toggle draft mode")
             else:
                 self.io.tool_error("Pull request mode not supported in this repository type")
+
+    def cmd_buffer(self, args=""):
+        """Show or manage the current buffer status (Redis Cloud mode)"""
+        
+        if not hasattr(self.coder.repo, 'get_buffer_status'):
+            self.io.tool_error("Buffer commands are only available in Redis Cloud mode")
+            return
+        
+        args = args.strip().lower()
+        
+        if args == "clear":
+            # Clear the buffer
+            if hasattr(self.coder.repo, 'clear_buffer'):
+                self.coder.repo.clear_buffer()
+            else:
+                self.io.tool_error("Buffer clear not supported")
+        elif args == "status" or args == "":
+            # Show buffer status
+            try:
+                status = self.coder.repo.get_buffer_status()
+                
+                self.io.tool_output("📋 Buffer Status:")
+                self.io.tool_output(f"  Modified files: {status['file_count']}")
+                
+                if status['modified_files']:
+                    self.io.tool_output("  Files in buffer:")
+                    for file_path in status['modified_files'][:10]:  # Show first 10
+                        self.io.tool_output(f"    - {file_path}")
+                    if len(status['modified_files']) > 10:
+                        self.io.tool_output(f"    ... and {len(status['modified_files']) - 10} more")
+                else:
+                    self.io.tool_output("  No files in buffer")
+                
+                self.io.tool_output(f"  PR mode: {'✅ Enabled' if status['pr_mode_enabled'] else '❌ Disabled'}")
+                if status['pr_mode_enabled']:
+                    self.io.tool_output(f"  Base branch: {status['pr_base_branch']}")
+                    self.io.tool_output(f"  Draft PRs: {'Yes' if status['pr_draft'] else 'No'}")
+                
+                self.io.tool_output("\nUsage:")
+                self.io.tool_output("  /buffer         - Show this status")
+                self.io.tool_output("  /buffer clear   - Clear the buffer")
+                self.io.tool_output("  /pr on          - Enable PR mode")
+                self.io.tool_output("  /commit         - Create PR (if PR mode enabled)")
+                
+            except Exception as e:
+                self.io.tool_error(f"Error getting buffer status: {e}")
+        else:
+            self.io.tool_error("Invalid buffer command. Use: /buffer [status|clear]")
+
+    def cmd_github_test(self, args=""):
+        """Test GitHub token and repository access"""
+        
+        if not hasattr(self.coder.repo, 'repo_name'):
+            self.io.tool_error("GitHub test is only available in Redis Cloud mode")
+            return
+        
+        import os
+        import requests
+        
+        # Get GitHub token
+        token = os.getenv('GITHUB_TOKEN')
+        if not token:
+            self.io.tool_error("No GITHUB_TOKEN environment variable found")
+            self.io.tool_output("Set your GitHub token with: export GITHUB_TOKEN=your_token_here")
+            return
+        
+        headers = {
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            # Test 1: Verify token
+            self.io.tool_output("🔍 Testing GitHub token...")
+            user_url = "https://api.github.com/user"
+            user_response = requests.get(user_url, headers=headers)
+            
+            if user_response.status_code == 401:
+                self.io.tool_error("❌ Invalid GitHub token")
+                return
+            elif user_response.status_code != 200:
+                self.io.tool_error(f"❌ Token verification failed: {user_response.status_code}")
+                return
+            
+            user_info = user_response.json()
+            self.io.tool_output(f"✅ Token valid for user: {user_info.get('login')}")
+            
+            # Test 2: Check repository access
+            repo_name = getattr(self.coder.repo, 'repo_name', '')
+            if not repo_name or '/' not in repo_name:
+                self.io.tool_error("❌ Invalid repository name format")
+                return
+            
+            self.io.tool_output(f"🔍 Testing repository access: {repo_name}")
+            
+            owner, repo = repo_name.split('/', 1)
+            repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+            repo_response = requests.get(repo_url, headers=headers)
+            
+            if repo_response.status_code == 404:
+                self.io.tool_error(f"❌ Repository {repo_name} not found or not accessible")
+                return
+            elif repo_response.status_code != 200:
+                self.io.tool_error(f"❌ Repository access failed: {repo_response.status_code}")
+                return
+            
+            repo_info = repo_response.json()
+            self.io.tool_output(f"✅ Repository access confirmed: {repo_info.get('full_name')}")
+            
+            # Test 3: Check permissions
+            permissions = repo_info.get('permissions', {})
+            self.io.tool_output(f"📋 Permissions:")
+            self.io.tool_output(f"  Read: {'✅' if permissions.get('pull', False) else '❌'}")
+            self.io.tool_output(f"  Write: {'✅' if permissions.get('push', False) else '❌'}")
+            self.io.tool_output(f"  Admin: {'✅' if permissions.get('admin', False) else '❌'}")
+            
+            if not permissions.get('push', False):
+                self.io.tool_error("❌ No write access - cannot create pull requests")
+                self.io.tool_output("You need push permissions to create branches and PRs")
+            else:
+                self.io.tool_output("✅ All checks passed - ready for PR creation!")
+                
+        except Exception as e:
+            self.io.tool_error(f"❌ GitHub test failed: {e}")
+
+    def cmd_repo_info(self, args=""):
+        """Show current repository information"""
+        
+        if not hasattr(self.coder.repo, 'repo_name'):
+            self.io.tool_error("Repository info is only available in Redis Cloud mode")
+            return
+        
+        try:
+            repo = self.coder.repo
+            self.io.tool_output("📋 Repository Information:")
+            self.io.tool_output(f"  Name: {getattr(repo, 'repo_name', 'Unknown')}")
+            self.io.tool_output(f"  URL: {getattr(repo, 'repo_url', 'Unknown')}")
+            self.io.tool_output(f"  Root: {getattr(repo, 'root', 'Unknown')}")
+            self.io.tool_output(f"  PR Mode: {'✅ Enabled' if getattr(repo, 'create_pull_request', False) else '❌ Disabled'}")
+            
+            if hasattr(repo, 'pr_base_branch'):
+                self.io.tool_output(f"  Base Branch: {repo.pr_base_branch}")
+            
+            if hasattr(repo, 'pr_draft'):
+                self.io.tool_output(f"  Draft PRs: {'Yes' if repo.pr_draft else 'No'}")
+            
+            # Show buffer status if available
+            if hasattr(repo, 'get_buffer_status'):
+                status = repo.get_buffer_status()
+                self.io.tool_output(f"  Buffer Files: {status.get('file_count', 0)}")
+            
+        except Exception as e:
+            self.io.tool_error(f"Error getting repository info: {e}")
+
+    def cmd_recover(self, args=""):
+        """Recover corrupted repository cache by clearing and re-fetching from GitHub"""
+        
+        if not hasattr(self.coder.repo, 'repo_name'):
+            self.io.tool_error("Recovery is only available in Redis Cloud mode")
+            return
+        
+        repo_name = getattr(self.coder.repo, 'repo_name', '')
+        if not repo_name:
+            self.io.tool_error("No repository name found for recovery")
+            return
+        
+        # Confirm with user
+        if not self.io.confirm_ask(f"Clear cache and re-fetch {repo_name} from GitHub?", default="y"):
+            self.io.tool_output("Recovery cancelled")
+            return
+        
+        try:
+            # Call the auto-recovery method
+            if hasattr(self.coder.repo, '_auto_recover_repository'):
+                self.io.tool_output(f"🔄 Starting manual recovery for {repo_name}...")
+                self.coder.repo._auto_recover_repository()
+                self.io.tool_output("✅ Recovery completed. You may need to restart the session to see changes.")
+            else:
+                self.io.tool_error("Recovery method not available for this repository type")
+                
+        except Exception as e:
+            self.io.tool_error(f"Recovery failed: {e}")
+
+    def cmd_health(self, args=""):
+        """Check the health of the repository cache and suggest recovery if needed"""
+        
+        if not hasattr(self.coder.repo, 'get_repository_health'):
+            self.io.tool_error("Health check is only available in Redis Cloud mode")
+            return
+        
+        try:
+            health = self.coder.repo.get_repository_health()
+            
+            self.io.tool_output("🏥 Repository Health Check")
+            self.io.tool_output("=" * 40)
+            self.io.tool_output(f"📂 Repository: {health['repo_name']}")
+            self.io.tool_output(f"💾 Cache Status: {'✅ Healthy' if health['cache_healthy'] else '❌ Unhealthy'}")
+            self.io.tool_output(f"🗂️  Virtual FS: {'✅ Healthy' if health['virtual_fs_healthy'] else '❌ Unhealthy'}")
+            self.io.tool_output(f"📄 Files Found: {health['files_extracted']}")
+            
+            if health['issues']:
+                self.io.tool_output("\n⚠️  Issues Found:")
+                for issue in health['issues']:
+                    self.io.tool_output(f"   • {issue}")
+                
+                self.io.tool_output("\n💡 Recommended Actions:")
+                self.io.tool_output("   • Use /recover to clear cache and re-fetch from GitHub")
+                self.io.tool_output("   • Check your Redis connection and GitHub token")
+                self.io.tool_output("   • Verify the repository exists and is accessible")
+            else:
+                self.io.tool_output("\n✅ Repository is healthy!")
+                
+        except Exception as e:
+            self.io.tool_error(f"Health check failed: {e}")
 
     def cmd_lint(self, args="", fnames=None):
         "Lint and fix in-chat files or all dirty files if none in chat"
@@ -1028,91 +1281,106 @@ class Commands:
 
     def cmd_git(self, args):
         "Run a git command (output excluded from chat)"
-        combined_output = None
-        try:
-            args = "git " + args
-            env = dict(subprocess.os.environ)
-            env["GIT_EDITOR"] = "true"
-            result = subprocess.run(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-                shell=True,
-                encoding=self.io.encoding,
-                errors="replace",
-            )
-            combined_output = result.stdout
-        except Exception as e:
-            self.io.tool_error(f"Error running /git command: {e}")
+        
+        # PERMANENTLY DISABLED: Git command execution not supported in Redis Cloud mode
+        self.io.tool_error("❌ Git command execution is permanently disabled in Redis Cloud mode.")
+        self.io.tool_output("💡 Use /pr commands to manage pull requests instead of direct git commands.")
+        self.io.tool_output("📋 Available commands: /pr on, /pr off, /pr base <branch>, /buffer, /commit")
+        return None
 
-        if combined_output is None:
-            return
-
-        self.io.tool_output(combined_output)
+        # ========================================================================
+        # ORIGINAL IMPLEMENTATION PERMANENTLY COMMENTED OUT FOR SECURITY
+        # ========================================================================
+        # combined_output = None
+        # try:
+        #     args = "git " + args
+        #     env = dict(subprocess.os.environ)
+        #     env["GIT_EDITOR"] = "true"
+        #     result = subprocess.run(
+        #         args,
+        #         stdout=subprocess.PIPE,
+        #         stderr=subprocess.STDOUT,
+        #         text=True,
+        #         env=env,
+        #         shell=True,
+        #         encoding=self.io.encoding,
+        #         errors="replace",
+        #     )
+        #     combined_output = result.stdout
+        # except Exception as e:
+        #     self.io.tool_error(f"Error running /git command: {e}")
+        # if combined_output is None:
+        #     return
+        # self.io.tool_output(combined_output)
+        # ========================================================================
 
     def cmd_test(self, args):
         "Run a shell command and add the output to the chat on non-zero exit code"
-        if not args and self.coder.test_cmd:
-            args = self.coder.test_cmd
+        
+        # PERMANENTLY DISABLED: Shell command execution not supported in Redis Cloud mode
+        self.io.tool_error("❌ Test command execution is permanently disabled in Redis Cloud mode.")
+        self.io.tool_output("💡 Create a pull request with your changes for testing in CI/CD pipelines.")
+        self.io.tool_output("🚀 Use /commit to create a PR with your changes")
+        return None
 
-        if not args:
-            return
-
-        if not callable(args):
-            if type(args) is not str:
-                raise ValueError(repr(args))
-            return self.cmd_run(args, True)
-
-        errors = args()
-        if not errors:
-            return
-
-        self.io.tool_output(errors)
-        return errors
+        # ========================================================================
+        # ORIGINAL IMPLEMENTATION PERMANENTLY COMMENTED OUT FOR SECURITY
+        # ========================================================================
+        # if not args and self.coder.test_cmd:
+        #     args = self.coder.test_cmd
+        # if not args:
+        #     return
+        # if not callable(args):
+        #     if type(args) is not str:
+        #         raise ValueError(repr(args))
+        #     return self.cmd_run(args, True)
+        # errors = args()
+        # if not errors:
+        #     return
+        # self.io.tool_output(errors)
+        # return errors
+        # ========================================================================
 
     def cmd_run(self, args, add_on_nonzero_exit=False):
         "Run a shell command and optionally add the output to the chat (alias: !)"
-        exit_status, combined_output = run_cmd(
-            args, verbose=self.verbose, error_print=self.io.tool_error, cwd=self.coder.root
-        )
-
-        if combined_output is None:
-            return
-
-        # Calculate token count of output
-        token_count = self.coder.main_model.token_count(combined_output)
-        k_tokens = token_count / 1000
-
-        if add_on_nonzero_exit:
-            add = exit_status != 0
-        else:
-            add = self.io.confirm_ask(f"Add {k_tokens:.1f}k tokens of command output to the chat?")
-
-        if add:
-            num_lines = len(combined_output.strip().splitlines())
-            line_plural = "line" if num_lines == 1 else "lines"
-            self.io.tool_output(f"Added {num_lines} {line_plural} of output to the chat.")
-
-            msg = prompts.run_output.format(
-                command=args,
-                output=combined_output,
-            )
-
-            self.coder.cur_messages += [
-                dict(role="user", content=msg),
-                dict(role="assistant", content="Ok."),
-            ]
-
-            if add_on_nonzero_exit and exit_status != 0:
-                # Return the formatted output message for test failures
-                return msg
-            elif add and exit_status != 0:
-                self.io.placeholder = "What's wrong? Fix"
-
-        # Return None if output wasn't added or command succeeded
+        
+        # PERMANENTLY DISABLED: Shell command execution not supported in Redis Cloud mode
+        self.io.tool_error("❌ Shell command execution is permanently disabled in Redis Cloud mode.")
+        self.io.tool_output("💡 Changes are automatically staged in a buffer for pull request creation.")
+        self.io.tool_output("📋 Use /buffer to see staged changes")
+        self.io.tool_output("🔧 Use /pr on to enable pull request mode (for your own repos only)")
+        self.io.tool_output("🚀 Use /commit to create a PR with your changes")
         return None
+
+        # ========================================================================
+        # ORIGINAL IMPLEMENTATION PERMANENTLY COMMENTED OUT FOR SECURITY
+        # ========================================================================
+        # exit_status, combined_output = run_cmd(
+        #     args, verbose=self.verbose, error_print=self.io.tool_error, cwd=self.coder.root
+        # )
+        # if combined_output is None:
+        #     return
+        # token_count = self.coder.main_model.token_count(combined_output)
+        # k_tokens = token_count / 1000
+        # if add_on_nonzero_exit:
+        #     add = exit_status != 0
+        # else:
+        #     add = self.io.confirm_ask(f"Add {k_tokens:.1f}k tokens of command output to the chat?")
+        # if add:
+        #     num_lines = len(combined_output.strip().splitlines())
+        #     line_plural = "line" if num_lines == 1 else "lines"
+        #     self.io.tool_output(f"Added {num_lines} {line_plural} of output to the chat.")
+        #     msg = prompts.run_output.format(command=args, output=combined_output)
+        #     self.coder.cur_messages += [
+        #         dict(role="user", content=msg),
+        #         dict(role="assistant", content="Ok."),
+        #     ]
+        #     if add_on_nonzero_exit and exit_status != 0:
+        #         return msg
+        #     elif add and exit_status != 0:
+        #         self.io.placeholder = "What's wrong? Fix"
+        # return None
+        # ========================================================================
 
     def cmd_exit(self, args):
         "Exit the application"

@@ -128,6 +128,24 @@ class VirtualFileSystemIO:
         """
         return self.read_text(filename, silent=True)
     
+    def get_file_content_for_pr(self, filename):
+        """
+        Get file content for PR creation, prioritizing modified content.
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            File content as string (modified if available, otherwise original)
+        """
+        # First check if we have modified content
+        modified_content = self.get_modified_content(filename)
+        if modified_content is not None:
+            return modified_content
+        
+        # Fall back to original content from virtual filesystem
+        return self.read_text(filename, silent=True)
+    
     def write_text(self, filename, content, encoding='utf-8'):
         """
         Write text to file and store modified content for PR creation.
@@ -138,8 +156,8 @@ class VirtualFileSystemIO:
             encoding: Text encoding (default: utf-8)
         """
         try:
-            # Write to actual filesystem first
-            result = self.original_io.write_text(filename, content, encoding)
+            # Write to actual filesystem first - the original IO doesn't accept encoding as parameter
+            result = self.original_io.write_text(filename, content)
             
             # Store modified content for PR creation
             # Convert to relative path for consistent tracking
@@ -167,7 +185,8 @@ class VirtualFileSystemIO:
                     self.modified_files[str(filename)] = content
             else:
                 self.modified_files[str(filename)] = content
-            raise
+            # Don't re-raise the exception since we've stored the content for PR creation
+            logger.info(f"Content stored in buffer for {filename} despite write error")
     
     def get_modified_content(self, filename):
         """
@@ -436,6 +455,37 @@ class RedisRepoManager:
         
         logger.info(f"Initialized RedisRepoManager for {self.repo_name}")
     
+    def get_file_content_for_pr(self, filename):
+        """
+        Get file content for PR creation, prioritizing modified content from IO wrapper.
+        
+        Args:
+            filename: Path to the file
+            
+        Returns:
+            File content as string (modified if available, otherwise original)
+        """
+        # Check if we have modified content in the IO wrapper
+        if hasattr(self.io, 'get_modified_content'):
+            modified_content = self.io.get_modified_content(filename)
+            if modified_content is not None:
+                return modified_content
+        
+        # Fall back to virtual filesystem content
+        if self.virtual_fs:
+            # Convert absolute path to relative if needed
+            file_path = Path(filename)
+            if file_path.is_absolute():
+                try:
+                    rel_path = file_path.relative_to(self.root)
+                    return self.virtual_fs.extract_file_with_context(str(rel_path))
+                except ValueError:
+                    pass
+            
+            return self.virtual_fs.extract_file_with_context(str(filename))
+        
+        return None
+    
     def _init_repomap(self) -> None:
         """Initialize RepoMap for the cloud-based repository."""
         try:
@@ -616,39 +666,211 @@ class RedisRepoManager:
             # Allow access if validation fails (graceful degradation)
     
     def _load_repository_data(self) -> None:
-        """Load repository data from Redis and initialize virtual filesystem."""
-        try:
-            repo_data = self.redis_cache.get_repository_data_cached(self.repo_name)
-            
-            if not repo_data:
-                logger.warning(f"No repository data found for {self.repo_name}")
-                # Initialize empty virtual filesystem
-                self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+        """Load repository data from Redis and initialize virtual filesystem with auto-recovery."""
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                repo_data = self.redis_cache.get_repository_data_cached(self.repo_name)
+                
+                if not repo_data:
+                    if retry_count == 0:
+                        logger.warning(f"No repository data found for {self.repo_name}, attempting auto-recovery")
+                        self._auto_recover_repository()
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.warning(f"No repository data found for {self.repo_name} after recovery attempt")
+                        # Initialize empty virtual filesystem
+                        self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+                        return
+                
+                content_md = repo_data.get('content', '')
+                tree_txt = repo_data.get('tree', '')
+                
+                # Validate that we have meaningful content
+                if not content_md or not content_md.strip():
+                    if retry_count == 0:
+                        logger.warning(f"Empty or missing content.md for {self.repo_name}, attempting auto-recovery")
+                        self._auto_recover_repository()
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.error(f"Empty content.md for {self.repo_name} after recovery attempt")
+                        # Initialize empty virtual filesystem as fallback
+                        self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+                        return
+                
+                # Get storage directory from environment or use default
+                storage_dir = os.getenv('STORAGE_DIR', '/tmp/repo_storage')
+                
+                # Initialize virtual filesystem with indexing support
+                self.virtual_fs = IntelligentVirtualFileSystem(
+                    content_md, 
+                    tree_txt, 
+                    self.repo_name,
+                    repo_storage_dir=storage_dir
+                )
+                
+                # Validate virtual filesystem was created successfully
+                if not self.virtual_fs or not hasattr(self.virtual_fs, 'get_tracked_files'):
+                    if retry_count == 0:
+                        logger.warning(f"Failed to initialize virtual filesystem for {self.repo_name}, attempting auto-recovery")
+                        self._auto_recover_repository()
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.error(f"Failed to initialize virtual filesystem for {self.repo_name} after recovery")
+                        self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+                        return
+                
+                # Extract files to disk for repo-map compatibility
+                self._extract_files_to_disk()
+                
+                logger.info(f"Successfully loaded repository data for {self.repo_name}")
                 return
+                
+            except Exception as e:
+                if retry_count == 0:
+                    logger.warning(f"Error loading repository data for {self.repo_name}: {e}, attempting auto-recovery")
+                    self._auto_recover_repository()
+                    retry_count += 1
+                    continue
+                else:
+                    logger.error(f"Error loading repository data for {self.repo_name} after recovery: {e}")
+                    # Initialize empty virtual filesystem as fallback
+                    self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+                    return
+    
+    def _auto_recover_repository(self) -> None:
+        """Auto-recover repository by clearing cache and re-fetching from GitHub."""
+        try:
+            if self.original_io:
+                self.original_io.tool_output(f"🔄 Auto-recovering repository {self.repo_name}...")
+                self.original_io.tool_output("   Clearing corrupted cache and re-fetching from GitHub...")
             
-            content_md = repo_data.get('content', '')
-            tree_txt = repo_data.get('tree', '')
+            logger.info(f"Starting auto-recovery for {self.repo_name}")
             
-            # Get storage directory from environment or use default
-            storage_dir = os.getenv('STORAGE_DIR', '/tmp/repo_storage')
+            # Step 1: Clear the corrupted cache
+            if hasattr(self.redis_cache, 'smart_invalidate'):
+                success = self.redis_cache.smart_invalidate(self.repo_name)
+                if success:
+                    logger.info(f"Successfully cleared cache for {self.repo_name}")
+                else:
+                    logger.warning(f"Failed to clear cache for {self.repo_name}")
             
-            # Initialize virtual filesystem with indexing support
-            self.virtual_fs = IntelligentVirtualFileSystem(
-                content_md, 
-                tree_txt, 
-                self.repo_name,
-                repo_storage_dir=storage_dir
-            )
+            # Step 2: Clear local cache files if they exist
+            import shutil
+            local_cache_dir = f"/tmp/repo_storage/{self.repo_name}"
+            if os.path.exists(local_cache_dir):
+                try:
+                    shutil.rmtree(local_cache_dir)
+                    logger.info(f"Cleared local cache directory: {local_cache_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clear local cache directory {local_cache_dir}: {e}")
             
-            # Extract files to disk for repo-map compatibility
-            self._extract_files_to_disk()
+            # Step 3: Re-fetch repository from GitHub
+            try:
+                from cosmos.repo_fetch import fetch_and_store_repo
+                
+                # Convert repo_name to URL format if needed
+                repo_url = self.repo_url
+                if not repo_url or repo_url == "unknown":
+                    if '/' in self.repo_name:
+                        repo_url = f"https://github.com/{self.repo_name}"
+                    else:
+                        logger.error(f"Cannot determine GitHub URL for {self.repo_name}")
+                        return
+                
+                if self.original_io:
+                    self.original_io.tool_output(f"   Re-fetching {repo_url} from GitHub...")
+                
+                success = fetch_and_store_repo(repo_url)
+                if success:
+                    logger.info(f"Successfully re-fetched repository {self.repo_name}")
+                    if self.original_io:
+                        self.original_io.tool_output(f"✅ Repository {self.repo_name} recovered successfully!")
+                else:
+                    logger.error(f"Failed to re-fetch repository {self.repo_name}")
+                    if self.original_io:
+                        self.original_io.tool_error(f"❌ Failed to recover repository {self.repo_name}")
+                        
+            except ImportError:
+                logger.error("repo_fetch module not available for auto-recovery")
+                if self.original_io:
+                    self.original_io.tool_error("❌ Auto-recovery module not available")
+            except Exception as e:
+                logger.error(f"Error during repository re-fetch: {e}")
+                if self.original_io:
+                    self.original_io.tool_error(f"❌ Error during recovery: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error during auto-recovery for {self.repo_name}: {e}")
+            if self.original_io:
+                self.original_io.tool_error(f"❌ Auto-recovery failed: {e}")
+    
+    def _validate_repository_data(self, repo_data: dict) -> bool:
+        """Validate that repository data is complete and usable."""
+        if not repo_data:
+            return False
+        
+        content_md = repo_data.get('content', '')
+        tree_txt = repo_data.get('tree', '')
+        
+        # Check if content.md exists and has meaningful content
+        if not content_md or not content_md.strip():
+            logger.warning(f"Missing or empty content.md for {self.repo_name}")
+            return False
+        
+        # Check if content.md has the expected structure
+        if '# ' not in content_md and '## ' not in content_md:
+            logger.warning(f"content.md appears to be malformed for {self.repo_name}")
+            return False
+        
+        # Check if tree.txt exists
+        if not tree_txt or not tree_txt.strip():
+            logger.warning(f"Missing or empty tree.txt for {self.repo_name}")
+            return False
+        
+        # Basic validation passed
+        return True
+    
+    def get_repository_health(self) -> dict:
+        """Get health status of the repository cache."""
+        health = {
+            'repo_name': self.repo_name,
+            'cache_healthy': False,
+            'virtual_fs_healthy': False,
+            'files_extracted': 0,
+            'issues': []
+        }
+        
+        try:
+            # Check cache data
+            repo_data = self.redis_cache.get_repository_data_cached(self.repo_name)
+            if self._validate_repository_data(repo_data):
+                health['cache_healthy'] = True
+            else:
+                health['issues'].append('Cache data is missing or corrupted')
             
-            logger.info(f"Loaded repository data for {self.repo_name}")
+            # Check virtual filesystem
+            if self.virtual_fs and hasattr(self.virtual_fs, 'get_tracked_files'):
+                try:
+                    tracked_files = self.virtual_fs.get_tracked_files()
+                    health['files_extracted'] = len(tracked_files)
+                    health['virtual_fs_healthy'] = len(tracked_files) > 0
+                    if len(tracked_files) == 0:
+                        health['issues'].append('No files found in virtual filesystem')
+                except Exception as e:
+                    health['issues'].append(f'Virtual filesystem error: {e}')
+            else:
+                health['issues'].append('Virtual filesystem not initialized')
             
         except Exception as e:
-            logger.error(f"Error loading repository data for {self.repo_name}: {e}")
-            # Initialize empty virtual filesystem as fallback
-            self.virtual_fs = IntelligentVirtualFileSystem("", "", self.repo_name)
+            health['issues'].append(f'Health check error: {e}')
+        
+        return health
     
     def _extract_files_to_local(self) -> None:
         """Extract files from virtual filesystem to local directory for repo-map compatibility."""
@@ -751,7 +973,10 @@ class RedisRepoManager:
     
     def commit(self, fnames=None, context=None, message=None, cosmos_edits=False, coder=None):
         """
-        Simulate commit operation (no-op for Redis backend).
+        Buffer-based commit operation for Redis backend.
+        
+        In Redis Cloud mode, this method stages changes in a buffer and creates
+        a pull request if PR mode is enabled, otherwise just logs the changes.
         
         Args:
             fnames: List of filenames to commit
@@ -759,11 +984,120 @@ class RedisRepoManager:
             message: Commit message
             cosmos_edits: Whether these are cosmos edits
             coder: Coder instance
+            
+        Returns:
+            tuple: (commit_hash, commit_message) if successful, None otherwise
         """
-        # Redis backend doesn't support commits - this is a no-op
-        if message:
-            logger.info(f"Simulated commit for {self.repo_name}: {message}")
-        return None
+        # Check if we have any modified files in the buffer
+        modified_files = []
+        if hasattr(self.io, 'modified_files') and self.io.modified_files:
+            modified_files = list(self.io.modified_files.keys())
+        
+        if not modified_files and not fnames:
+            if self.original_io:
+                self.original_io.tool_output("No changes to commit in buffer.")
+            return None
+        
+        # Generate commit message if not provided
+        if not message:
+            if context and coder:
+                try:
+                    message = self.get_commit_message(
+                        diffs="Changes made via cosmos chat",
+                        context=context,
+                        user_language=getattr(coder, 'commit_language', None)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to generate commit message: {e}")
+                    message = f"Update files in {self.repo_name}"
+            else:
+                message = f"Update files in {self.repo_name}"
+        
+        # If PR mode is enabled, create a pull request (only for own repos)
+        if self.create_pull_request:
+            result = self.commit_and_create_pr(fnames, context, message, cosmos_edits, coder)
+            if result and result.get('commit_hash'):
+                return result['commit_hash'], result['commit_message']
+            return None
+        
+        # Otherwise, just stage changes in buffer and log
+        commit_hash = f"buffer_{int(time.time())}"
+        
+        if self.original_io:
+            self.original_io.tool_output(f"📋 Changes staged in buffer: {message}", bold=True)
+            if modified_files:
+                self.original_io.tool_output(f"📁 Modified files ({len(modified_files)}):")
+                for i, file_path in enumerate(modified_files[:5]):
+                    self.original_io.tool_output(f"   {i+1}. {file_path}")
+                if len(modified_files) > 5:
+                    self.original_io.tool_output(f"   ... and {len(modified_files) - 5} more files")
+            
+            # Check if this is an external repository and provide appropriate guidance
+            if self.repo_name and '/' in self.repo_name:
+                owner = self.repo_name.split('/')[0]
+                github_token = self.github_token or os.getenv('GITHUB_TOKEN')
+                
+                if github_token:
+                    try:
+                        import requests
+                        headers = {
+                            'Authorization': f'token {github_token}',
+                            'Accept': 'application/vnd.github.v3+json'
+                        }
+                        
+                        user_response = requests.get("https://api.github.com/user", headers=headers)
+                        if user_response.status_code == 200:
+                            current_user = user_response.json()['login']
+                            
+                            if owner.lower() != current_user.lower():
+                                self.original_io.tool_output(f"\n⚠️  Note: {self.repo_name} belongs to {owner}, not you ({current_user})")
+                                self.original_io.tool_output("💡 Next steps for external repositories:")
+                                self.original_io.tool_output("   • Use /buffer to view all staged changes")
+                                self.original_io.tool_output("   • Copy the changes to your own repository")
+                                self.original_io.tool_output("   • Create PRs only in repositories you own")
+                                return commit_hash, message
+                    except:
+                        pass  # Ignore errors in ownership check for buffer mode
+            
+            self.original_io.tool_output("\n💡 Next steps:")
+            self.original_io.tool_output("   • Use /buffer to view all staged changes")
+            self.original_io.tool_output("   • Use /pr on to enable pull request mode (own repos only)")
+            self.original_io.tool_output("   • Use /commit to create a PR with your changes")
+        
+        logger.info(f"Staged changes in buffer for {self.repo_name}: {message}")
+        return commit_hash, message
+    
+    def get_buffer_status(self):
+        """
+        Get the current status of the buffer (modified files).
+        
+        Returns:
+            dict: Buffer status information
+        """
+        status = {
+            'modified_files': [],
+            'file_count': 0,
+            'pr_mode_enabled': self.create_pull_request,
+            'pr_base_branch': self.pr_base_branch,
+            'pr_draft': self.pr_draft
+        }
+        
+        if hasattr(self.io, 'modified_files') and self.io.modified_files:
+            status['modified_files'] = list(self.io.modified_files.keys())
+            status['file_count'] = len(self.io.modified_files)
+        
+        return status
+    
+    def clear_buffer(self):
+        """
+        Clear the buffer of modified files.
+        """
+        if hasattr(self.io, 'modified_files'):
+            self.io.modified_files.clear()
+            if self.original_io:
+                self.original_io.tool_output("Buffer cleared.")
+        
+        logger.info(f"Cleared buffer for {self.repo_name}")
 
     def commit_and_create_pr(self, fnames=None, context=None, message=None, cosmos_edits=False, coder=None):
         """
@@ -798,15 +1132,57 @@ class RedisRepoManager:
                 'pr_info': None
             }
         
-        # Check if we have GitHub token
-        github_token = self.github_token or os.getenv('GITHUB_TOKEN')
-        if not github_token:
-            self.original_io.tool_error("GitHub token required for PR creation. Set GITHUB_TOKEN environment variable or use --github-token")
-            return {
-                'commit_hash': 'error_no_token',
-                'commit_message': message or f"Update files in {self.repo_name}",
-                'pr_info': None
-            }
+        # EARLY OWNERSHIP CHECK - Check repository ownership before attempting PR
+        if self.repo_name and '/' in self.repo_name:
+            owner = self.repo_name.split('/')[0]
+            
+            # Check if we have GitHub token
+            github_token = self.github_token or os.getenv('GITHUB_TOKEN')
+            if not github_token:
+                self.original_io.tool_error("❌ GitHub token required for PR creation. Set GITHUB_TOKEN environment variable")
+                return {
+                    'commit_hash': 'error_no_token',
+                    'commit_message': message or f"Update files in {self.repo_name}",
+                    'pr_info': None
+                }
+            
+            # Quick ownership check using GitHub API
+            try:
+                import requests
+                headers = {
+                    'Authorization': f'token {github_token}',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+                
+                user_response = requests.get("https://api.github.com/user", headers=headers)
+                if user_response.status_code == 200:
+                    current_user = user_response.json()['login']
+                    
+                    if owner.lower() != current_user.lower():
+                        self.original_io.tool_error(f"❌ Cannot create PR: Repository {self.repo_name} belongs to {owner}, but you are {current_user}")
+                        self.original_io.tool_output("💡 You can only create pull requests for your own repositories")
+                        self.original_io.tool_output("📋 Your changes are safely stored in the buffer")
+                        self.original_io.tool_output("🔄 Use /buffer to view changes, then copy them to your own repository")
+                        return {
+                            'commit_hash': 'error_not_owner',
+                            'commit_message': message or f"Update files in {self.repo_name}",
+                            'pr_info': None
+                        }
+                else:
+                    self.original_io.tool_error("❌ Failed to verify GitHub user. Check your GITHUB_TOKEN")
+                    return {
+                        'commit_hash': 'error_token_invalid',
+                        'commit_message': message or f"Update files in {self.repo_name}",
+                        'pr_info': None
+                    }
+                    
+            except Exception as e:
+                self.original_io.tool_error(f"❌ Error checking repository ownership: {e}")
+                return {
+                    'commit_hash': 'error_ownership_check',
+                    'commit_message': message or f"Update files in {self.repo_name}",
+                    'pr_info': None
+                }
         
         # Import the GitHub PR module
         try:
